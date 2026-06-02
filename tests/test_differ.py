@@ -177,5 +177,20 @@ def test_format_overall_lists_active():
     assert "Database upgrade" in text
 
 
+def test_format_overall_green_indicator_with_active_incident():
+    """Индикатор страницы 'none', но инцидент открыт — заголовок не должен врать."""
+    snapshot = load_snapshot()
+    snapshot.indicator = "none"
+    snapshot.description = "All Systems Operational"
+    snapshot.maintenances = []  # оставляем только инцидент major
+
+    text = format_overall(snapshot, UTC)
+    first_line = text.splitlines()[0]
+    assert "All Systems Operational" not in first_line
+    assert "✅" not in first_line  # зелёная галка убрана
+    assert "Partial System Outage" in first_line  # impact инцидента — major
+    assert "Elevated API error rates" in text
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

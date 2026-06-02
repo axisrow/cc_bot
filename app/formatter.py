@@ -36,6 +36,16 @@ _INDICATOR_EMOJI = {
     "maintenance": "🛠",
 }
 
+# Серьёзность impact/индикатора для сравнения (чем больше — тем хуже).
+_SEVERITY_RANK = {"none": 0, "maintenance": 0, "minor": 1, "major": 2, "critical": 3}
+_RANK_INDICATOR = {1: "minor", 2: "major", 3: "critical"}
+# Подписи, когда заголовок выводим сами (индикатор страницы недооценил ситуацию).
+_INDICATOR_LABEL = {
+    "minor": "Minor Service Issues",
+    "major": "Partial System Outage",
+    "critical": "Major System Outage",
+}
+
 
 def _esc(text: str | None) -> str:
     return html.escape(text or "")
@@ -137,16 +147,28 @@ def format_event(event: Event, tz: ZoneInfo) -> str:
 
 def format_overall(snapshot: StatusSnapshot, tz: ZoneInfo) -> str:
     """Сводка текущего состояния для команды /status."""
-    emoji = _INDICATOR_EMOJI.get(snapshot.indicator, "ℹ️")
-    description = snapshot.description or "Status unknown"
-    lines = [f"{emoji} <b>{_esc(description)}</b>"]
-
     active_incidents = [
         i for i in snapshot.incidents if i.get("status") != "resolved"
     ]
     active_maintenances = [
         m for m in snapshot.maintenances if m.get("status") != "completed"
     ]
+
+    emoji = _INDICATOR_EMOJI.get(snapshot.indicator, "ℹ️")
+    description = snapshot.description or "Status unknown"
+    # Statuspage иногда держит общий индикатор зелёным ("none"), пока инцидент
+    # ещё не задел компоненты. Если есть активные инциденты, не показываем
+    # «All Systems Operational» — иначе заголовок противоречит списку ниже.
+    if active_incidents and _SEVERITY_RANK.get(snapshot.indicator, 0) == 0:
+        worst = max(
+            (_SEVERITY_RANK.get(i.get("impact", "none"), 0) for i in active_incidents),
+            default=0,
+        )
+        effective = _RANK_INDICATOR[max(worst, _SEVERITY_RANK["minor"])]
+        emoji = _INDICATOR_EMOJI[effective]
+        description = _INDICATOR_LABEL[effective]
+
+    lines = [f"{emoji} <b>{_esc(description)}</b>"]
 
     if active_incidents:
         lines.append("")

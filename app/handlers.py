@@ -1,10 +1,14 @@
-"""Команды бота: /start, /status, /id."""
+"""Команды бота: /start и /test.
+
+Бот автономен — сам опрашивает статус-страницу и шлёт уведомления (см. poller.py).
+На произвольные сообщения он не реагирует; ручная проверка — только через /test.
+"""
 
 from __future__ import annotations
 
 import logging
 
-from aiogram import F, Router
+from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -23,42 +27,17 @@ async def cmd_start(message: Message) -> None:
         "👋 <b>Claude Status Bot</b>\n\n"
         "Я слежу за <a href=\"https://status.claude.com\">status.claude.com</a> и "
         "присылаю уведомления об инцидентах, плановых работах и изменениях статусов сервисов.\n\n"
-        "Команды:\n"
-        "• /status — текущее состояние\n"
-        "• /id — узнать ID этого чата (для настройки CHAT_ID)"
+        "Команда /test — прислать текущее состояние прямо сейчас."
     )
 
 
-@router.message(Command("id"))
-async def cmd_id(message: Message) -> None:
-    chat = message.chat
-    await message.answer(
-        f"Chat ID: <code>{chat.id}</code>\n"
-        f"Type: <code>{chat.type}</code>\n\n"
-        "Впишите этот ID в переменную <code>CHAT_ID</code> в .env, чтобы получать уведомления сюда."
-    )
-
-
-@router.message(Command("status"))
-async def cmd_status(message: Message, config: Config, status_client: StatusClient) -> None:
-    await _reply_status(message, config, status_client, log_label="/status")
-
-
-# Тестовый хендлер: на ЛЮБОЕ сообщение в личке с ботом отдаём результат парсинга.
-# Зарегистрирован после команд, поэтому /start, /status, /id имеют приоритет.
-# Фильтр по private — чтобы не отвечать в групповом чате уведомлений.
-@router.message(F.chat.type == "private")
-async def any_message(message: Message, config: Config, status_client: StatusClient) -> None:
-    await _reply_status(message, config, status_client, log_label="any-message")
-
-
-async def _reply_status(
-    message: Message, config: Config, status_client: StatusClient, log_label: str
-) -> None:
+@router.message(Command("test"))
+async def cmd_test(message: Message, config: Config, status_client: StatusClient) -> None:
+    """Прислать текущий статус status.claude.com тому, кто отправил команду."""
     try:
         snapshot = await status_client.fetch()
     except Exception:
-        logger.exception("Не удалось получить статус для %s", log_label)
+        logger.exception("Не удалось получить статус для /test")
         await message.answer("⚠️ Не удалось получить данные со status.claude.com. Попробуйте позже.")
         return
 
