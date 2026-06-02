@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 
@@ -31,6 +32,39 @@ class StatusSnapshot:
     maintenances: list[dict]
 
 
+def build_snapshot(
+    summary: dict, incidents: list[dict], maintenances: list[dict]
+) -> StatusSnapshot:
+    """Собрать снапшот из summary.json и выделенных эндпоинтов."""
+    status = summary.get("status") or {}
+    return StatusSnapshot(
+        indicator=status.get("indicator", "unknown"),
+        description=status.get("description", ""),
+        components=summary.get("components", []),
+        incidents=incidents,
+        maintenances=maintenances,
+    )
+
+
+def summary_marker(summary: dict) -> str:
+    """Стабильная подпись summary.json — меняется только при реальном событии.
+
+    Основа — page.updated_at (это время последнего события, а не запроса), плюс
+    индикатор и статусы компонентов/активных инцидентов и работ как подстраховка.
+    Поллер сравнивает подпись с прошлой, чтобы не дёргать тяжёлые эндпоинты зря.
+    """
+    page = summary.get("page") or {}
+    status = summary.get("status") or {}
+    parts = [str(page.get("updated_at")), str(status.get("indicator"))]
+    for c in summary.get("components", []):
+        parts.append(f"c:{c.get('id')}={c.get('status')}")
+    for i in summary.get("incidents", []):
+        parts.append(f"i:{i.get('id')}={(latest_update(i) or {}).get('id')}:{i.get('status')}")
+    for m in summary.get("scheduled_maintenances", []):
+        parts.append(f"m:{m.get('id')}={(latest_update(m) or {}).get('id')}:{m.get('status')}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+
 class StatusClient:
     """Тонкая обёртка над тремя эндпоинтами Statuspage."""
 
@@ -44,23 +78,34 @@ class StatusClient:
             resp.raise_for_status()
             return await resp.json()
 
-    async def fetch(self) -> StatusSnapshot:
-        """Получить компоненты, инциденты и работы за один опрос.
+    async def fetch_summary(self) -> dict:
+        """Лёгкий запрос: только summary.json (компоненты + общий статус, ~2 КБ).
 
-        Компоненты и общий статус берём из summary.json; инциденты и работы —
-        из выделенных эндпоинтов, чтобы видеть resolved/completed события.
+        Поллер опрашивает его каждый цикл и по summary_marker решает, нужно ли
+        вообще тянуть тяжёлые эндпоинты.
         """
-        summary, incidents_data, maintenances_data = await asyncio.gather(
-            self._get_json("summary.json"),
+        return await self._get_json("summary.json")
+
+    async def fetch_details(self) -> tuple[list[dict], list[dict]]:
+        """Тяжёлые эндпоинты: инциденты и работы (видны resolved/completed)."""
+        incidents_data, maintenances_data = await asyncio.gather(
             self._get_json("incidents.json"),
             self._get_json("scheduled-maintenances.json"),
         )
-
-        status = summary.get("status") or {}
-        return StatusSnapshot(
-            indicator=status.get("indicator", "unknown"),
-            description=status.get("description", ""),
-            components=summary.get("components", []),
-            incidents=incidents_data.get("incidents", []),
-            maintenances=maintenances_data.get("scheduled_maintenances", []),
+        return (
+            incidents_data.get("incidents", []),
+            maintenances_data.get("scheduled_maintenances", []),
         )
+
+    async def fetch(self) -> StatusSnapshot:
+        """Полный опрос (summary + детали) без гейта. Используется командой /test.
+
+        Компоненты и общий статус берём из summary.json; инциденты и работы —
+        из выделенных эндпоинтов, чтобы видеть resolved/completed события.
+        Summary и детали тянем параллельно — латентность как у одного round-trip.
+        """
+        summary, (incidents, maintenances) = await asyncio.gather(
+            self.fetch_summary(),
+            self.fetch_details(),
+        )
+        return build_snapshot(summary, incidents, maintenances)

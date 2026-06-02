@@ -12,7 +12,7 @@ import pytest
 from app.differ import Event, diff
 from app.formatter import format_event, format_overall
 from app.state import empty_state
-from app.status_client import StatusSnapshot
+from app.status_client import StatusSnapshot, summary_marker
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample.json"
 UTC = ZoneInfo("UTC")
@@ -190,6 +190,92 @@ def test_format_overall_green_indicator_with_active_incident():
     assert "✅" not in first_line  # зелёная галка убрана
     assert "Partial System Outage" in first_line  # impact инцидента — major
     assert "Elevated API error rates" in text
+
+
+# --- Resolved-инцидент: зелёная галка + общий статус -------------------------
+
+def _resolved_snapshot() -> StatusSnapshot:
+    """Снапшот после резолва: инцидент resolved, страница снова operational."""
+    incident = {
+        "id": "inc_done",
+        "name": "Elevated errors on Opus 4.6",
+        "status": "resolved",
+        "impact": "major",
+        "shortlink": "https://stspg.io/j1r06qml3bvy",
+        "incident_updates": [
+            {"id": "u_res", "status": "resolved",
+             "body": "This incident has been resolved.",
+             "created_at": "2026-06-02T11:49:06Z"},
+        ],
+    }
+    return StatusSnapshot(
+        indicator="none",
+        description="All Systems Operational",
+        components=[],
+        incidents=[incident],
+        maintenances=[],
+    )
+
+
+def test_format_resolved_incident_shows_operational():
+    snapshot = _resolved_snapshot()
+    event = Event(kind="incident", action="update", obj=snapshot.incidents[0])
+    text = format_event(event, UTC, snapshot)
+
+    assert "✅" in text
+    assert "Incident resolved" in text
+    assert "All Systems Operational" in text
+    # оранжевый impact-эмодзи у resolved появляться не должен
+    assert "🟠" not in text
+
+
+def test_format_resolved_incident_keeps_warning_if_another_active():
+    """Если параллельно открыт другой инцидент — не врём «All Systems Operational»."""
+    snapshot = _resolved_snapshot()
+    snapshot.incidents = snapshot.incidents + [
+        {"id": "inc_open", "name": "Login failures", "status": "investigating",
+         "impact": "major", "incident_updates": []}
+    ]
+    event = Event(kind="incident", action="update", obj=snapshot.incidents[0])
+    text = format_event(event, UTC, snapshot)
+
+    assert "✅" in text  # сам разрешённый инцидент всё равно с галкой
+    assert "All Systems Operational" not in text
+    assert "Partial System Outage" in text  # impact активного инцидента — major
+
+
+# --- Гейт опроса: подпись summary -------------------------------------------
+
+def _sample_summary() -> dict:
+    return {
+        "page": {"updated_at": "2026-06-02T12:00:00.000Z"},
+        "status": {"indicator": "none", "description": "All Systems Operational"},
+        "components": [
+            {"id": "comp_api", "status": "operational"},
+            {"id": "comp_web", "status": "degraded_performance"},
+        ],
+        "incidents": [],
+        "scheduled_maintenances": [],
+    }
+
+
+def test_summary_marker_stable_for_same_input():
+    summary = _sample_summary()
+    assert summary_marker(summary) == summary_marker(copy.deepcopy(summary))
+
+
+def test_summary_marker_changes_on_component_status():
+    summary = _sample_summary()
+    before = summary_marker(summary)
+    summary["components"][0]["status"] = "major_outage"
+    assert summary_marker(summary) != before
+
+
+def test_summary_marker_changes_on_page_updated_at():
+    summary = _sample_summary()
+    before = summary_marker(summary)
+    summary["page"]["updated_at"] = "2026-06-02T13:00:00.000Z"
+    assert summary_marker(summary) != before
 
 
 if __name__ == "__main__":

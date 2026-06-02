@@ -12,7 +12,7 @@ from app.config import Config
 from app.differ import diff
 from app.formatter import format_event
 from app.state import load_state, save_state
-from app.status_client import StatusClient
+from app.status_client import StatusClient, build_snapshot, summary_marker
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +36,22 @@ async def poll_once(
     config: Config,
     state: dict,
 ) -> dict:
-    """Один цикл опроса: fetch -> diff -> отправка -> возврат нового состояния."""
-    snapshot = await client.fetch()
+    """Один цикл опроса: summary -> (гейт) -> diff -> отправка -> новое состояние."""
+    summary = await client.fetch_summary()
+    marker = summary_marker(summary)
     was_initialized = state.get("initialized", False)
 
+    # Гейт: если уже инициализированы и summary не менялся — тяжёлые эндпоинты
+    # (incidents.json ~200 КБ + работы) не дёргаем, событий всё равно быть не может.
+    if was_initialized and marker == state.get("summary_marker"):
+        logger.debug("summary не менялся — пропускаю тяжёлый опрос")
+        return state
+
+    incidents, maintenances = await client.fetch_details()
+    snapshot = build_snapshot(summary, incidents, maintenances)
+
     events, new_state = diff(snapshot, state)
+    new_state["summary_marker"] = marker
 
     if not was_initialized:
         # Первый запуск: молча засеваем состояние, один стартовый пинг.
@@ -63,7 +74,7 @@ async def poll_once(
     if events and config.chat_id is not None:
         logger.info("Отправляю %d уведомлений", len(events))
         for event in events:
-            await _send(bot, config.chat_id, format_event(event, config.timezone))
+            await _send(bot, config.chat_id, format_event(event, config.timezone, snapshot))
             await asyncio.sleep(_SEND_DELAY)
     elif events:
         logger.warning("Есть %d событий, но CHAT_ID не задан — не отправляю", len(events))

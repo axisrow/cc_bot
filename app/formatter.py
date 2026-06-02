@@ -78,11 +78,17 @@ def _latest_update_body(item: dict) -> tuple[str, str]:
     return update.get("body", ""), update.get("created_at", "")
 
 
-def _format_incident(event: Event, tz: ZoneInfo) -> str:
+def _format_incident(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = None) -> str:
     item = event.obj
     impact = item.get("impact", "none")
-    emoji = _IMPACT_EMOJI.get(impact, "🔵")
-    prefix = "New incident" if event.action == "new" else "Incident update"
+    resolved = item.get("status") == "resolved"
+
+    if resolved:
+        emoji = "✅"
+        prefix = "Incident resolved"
+    else:
+        emoji = _IMPACT_EMOJI.get(impact, "🔵")
+        prefix = "New incident" if event.action == "new" else "Incident update"
 
     body, when = _latest_update_body(item)
     lines = [
@@ -92,9 +98,17 @@ def _format_incident(event: Event, tz: ZoneInfo) -> str:
     if body:
         lines.append("")
         lines.append(_esc(body))
+    # Хвост: при resolved сначала актуальный общий статус страницы
+    # («All Systems Operational», если всё восстановилось), затем время — вплотную.
+    tail = []
+    if resolved and snapshot is not None:
+        overall_emoji, overall_desc = _overall_header(snapshot)
+        tail.append(f"{overall_emoji} <b>{_esc(overall_desc)}</b>")
     if when:
+        tail.append(f"🕒 {_esc(_fmt_time(when, tz))}")
+    if tail:
         lines.append("")
-        lines.append(f"🕒 {_esc(_fmt_time(when, tz))}")
+        lines.extend(tail)
     shortlink = item.get("shortlink")
     if shortlink:
         lines.append(f"🔗 {_esc(shortlink)}")
@@ -134,15 +148,42 @@ def _format_component(event: Event) -> str:
     )
 
 
-def format_event(event: Event, tz: ZoneInfo) -> str:
-    """Сформировать HTML-сообщение для одного события."""
+def format_event(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = None) -> str:
+    """Сформировать HTML-сообщение для одного события.
+
+    snapshot нужен только для инцидентов: при resolved к сообщению добавляется
+    строка общего статуса страницы. Для остальных видов он не используется.
+    """
     if event.kind == "incident":
-        return _format_incident(event, tz)
+        return _format_incident(event, tz, snapshot)
     if event.kind == "maintenance":
         return _format_maintenance(event, tz)
     if event.kind == "component":
         return _format_component(event)
     return _esc(str(event.obj.get("name", "")))
+
+
+def _overall_header(snapshot: StatusSnapshot) -> tuple[str, str]:
+    """Эмодзи и описание общего статуса страницы.
+
+    Statuspage иногда держит общий индикатор зелёным ("none"), пока инцидент
+    ещё не задел компоненты. Если есть активные инциденты, не показываем
+    «All Systems Operational» — иначе заголовок противоречит реальности.
+    """
+    active_incidents = [
+        i for i in snapshot.incidents if i.get("status") != "resolved"
+    ]
+    emoji = _INDICATOR_EMOJI.get(snapshot.indicator, "ℹ️")
+    description = snapshot.description or "Status unknown"
+    if active_incidents and _SEVERITY_RANK.get(snapshot.indicator, 0) == 0:
+        worst = max(
+            (_SEVERITY_RANK.get(i.get("impact", "none"), 0) for i in active_incidents),
+            default=0,
+        )
+        effective = _RANK_INDICATOR[max(worst, _SEVERITY_RANK["minor"])]
+        emoji = _INDICATOR_EMOJI[effective]
+        description = _INDICATOR_LABEL[effective]
+    return emoji, description
 
 
 def format_overall(snapshot: StatusSnapshot, tz: ZoneInfo) -> str:
@@ -154,20 +195,7 @@ def format_overall(snapshot: StatusSnapshot, tz: ZoneInfo) -> str:
         m for m in snapshot.maintenances if m.get("status") != "completed"
     ]
 
-    emoji = _INDICATOR_EMOJI.get(snapshot.indicator, "ℹ️")
-    description = snapshot.description or "Status unknown"
-    # Statuspage иногда держит общий индикатор зелёным ("none"), пока инцидент
-    # ещё не задел компоненты. Если есть активные инциденты, не показываем
-    # «All Systems Operational» — иначе заголовок противоречит списку ниже.
-    if active_incidents and _SEVERITY_RANK.get(snapshot.indicator, 0) == 0:
-        worst = max(
-            (_SEVERITY_RANK.get(i.get("impact", "none"), 0) for i in active_incidents),
-            default=0,
-        )
-        effective = _RANK_INDICATOR[max(worst, _SEVERITY_RANK["minor"])]
-        emoji = _INDICATOR_EMOJI[effective]
-        description = _INDICATOR_LABEL[effective]
-
+    emoji, description = _overall_header(snapshot)
     lines = [f"{emoji} <b>{_esc(description)}</b>"]
 
     if active_incidents:
