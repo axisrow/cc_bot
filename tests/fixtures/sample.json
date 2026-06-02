@@ -1,0 +1,38 @@
+{
+  "indicator": "minor",
+  "description": "Partially Degraded Service",
+  "components": [
+    {"id": "comp_api", "name": "API", "status": "operational", "group": false},
+    {"id": "comp_web", "name": "Claude.ai", "status": "degraded_performance", "group": false},
+    {"id": "grp_root", "name": "Core Services", "status": "operational", "group": true}
+  ],
+  "incidents": [
+    {
+      "id": "inc_1",
+      "name": "Elevated API error rates",
+      "status": "investigating",
+      "impact": "major",
+      "shortlink": "https://stspg.io/abc",
+      "updated_at": "2026-06-02T10:05:00Z",
+      "incident_updates": [
+        {"id": "upd_2", "status": "investigating", "body": "We are <looking> into errors.", "created_at": "2026-06-02T10:05:00Z"},
+        {"id": "upd_1", "status": "investigating", "body": "Investigating reports.", "created_at": "2026-06-02T10:00:00Z"}
+      ]
+    }
+  ],
+  "maintenances": [
+    {
+      "id": "mnt_1",
+      "name": "Database upgrade",
+      "status": "scheduled",
+      "impact": "maintenance",
+      "shortlink": "https://stspg.io/xyz",
+      "scheduled_for": "2026-06-05T01:00:00Z",
+      "scheduled_until": "2026-06-05T03:00:00Z",
+      "updated_at": "2026-06-01T09:00:00Z",
+      "incident_updates": [
+        {"id": "mupd_1", "status": "scheduled", "body": "Maintenance scheduled.", "created_at": "2026-06-01T09:00:00Z"}
+      ]
+    }
+  ]
+}

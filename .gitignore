@@ -1,0 +1,22 @@
+# Окружение
+.env
+
+# Состояние бота
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code (локальные персональные настройки)
+.claude/settings.local.json
