@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -10,7 +11,7 @@ import pytest
 
 from app.differ import Event, diff
 from app.formatter import format_event, format_overall
-from app.poller import poll_once
+from app.poller import poll_once, run_poller
 from app.state import empty_state
 from app.status_client import RssItem, StatusSnapshot, parse_rss_items
 
@@ -337,3 +338,63 @@ async def test_poller_ignores_json_component_changes_without_rss_event(monkeypat
     assert bot.edited == []
     assert client.fetch_count == 0
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_poller_first_run_seeds_silently(monkeypatch):
+    """Первый RSS-запуск засевает ленту молча: ни send, ни edit в чат."""
+    saved: list[dict] = []
+    monkeypatch.setattr("app.poller.save_state", lambda state: saved.append(copy.deepcopy(state)))
+    item = rss_item()
+    client = FakeClient([item], snapshot(json_incident()))
+
+    bot = FakeBot()
+    new_state = await poll_once(
+        bot,
+        client,
+        SimpleNamespace(chat_id=1, timezone=UTC),
+        empty_state(),
+    )
+
+    assert bot.sent == []
+    assert bot.edited == []
+    assert new_state["rss_initialized"] is True
+    assert new_state["rss_items"][item.guid]["pub_date"] == item.pub_date
+    assert client.fetch_count == 0  # не провалились в events-loop
+    assert saved and saved[-1]["rss_initialized"] is True
+
+
+async def _run_poller_until_first_poll(monkeypatch, bot, *, admin_id):
+    """Прогнать run_poller до первого poll_once (который сразу падает CancelledError)."""
+    monkeypatch.setattr("app.poller.load_state", lambda: seed_state(rss_item()))
+
+    async def stop(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.poller.poll_once", stop)
+    cfg = SimpleNamespace(admin_id=admin_id, chat_id=1, poll_interval=0, timezone=UTC)
+    with pytest.raises(asyncio.CancelledError):
+        await run_poller(bot, cfg, FakeClient([], snapshot()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admin_id, expected", [(169675602, [169675602]), (None, [])])
+async def test_run_poller_start_ping_goes_to_admin_only(monkeypatch, admin_id, expected):
+    """Стартовый пинг уходит ровно админу (или никому при ADMIN_ID=None), не в CHAT_ID."""
+    bot = FakeBot()
+    await _run_poller_until_first_poll(monkeypatch, bot, admin_id=admin_id)
+
+    assert [cid for cid, text in bot.sent if "Monitoring started" in text] == expected
+
+
+@pytest.mark.asyncio
+async def test_run_poller_survives_failed_admin_ping(monkeypatch):
+    """Сбой стартового пинга не валит поллер — он доходит до цикла опроса."""
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("admin chat unavailable")
+
+    bot = FakeBot()
+    monkeypatch.setattr(bot, "send_message", boom)
+    # CancelledError из первого poll_once докажет, что мы дошли до цикла, не упав на пинге.
+    await _run_poller_until_first_poll(monkeypatch, bot, admin_id=169675602)

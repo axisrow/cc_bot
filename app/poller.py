@@ -76,19 +76,12 @@ async def poll_once(
     events, new_state = diff(rss_items, state)
 
     if not was_initialized:
-        # Первый RSS-запуск: молча засеваем ленту, один стартовый пинг.
+        # Первый RSS-запуск: молча засеваем ленту, в чат ничего не шлём.
         save_state(new_state)
         logger.info(
             "Первый RSS-запуск: засеяно %d item-ов",
             len(new_state["rss_items"]),
         )
-        if config.chat_id is not None:
-            await _send(
-                bot,
-                config.chat_id,
-                "✅ <b>Monitoring started</b>\nWatching status.claude.com for "
-                "RSS incident updates.",
-            )
         return new_state
 
     if events and config.chat_id is not None:
@@ -119,6 +112,19 @@ async def run_poller(bot: Bot, config: Config, client: StatusClient) -> None:
         config.poll_interval,
         config.chat_id if config.chat_id is not None else "(CHAT_ID не задан)",
     )
+
+    # Служебный пинг админу при запуске поллер-таски (heartbeat «бот перезапустился»).
+    # Шлётся в личку ADMIN_ID, не в чат CHAT_ID, и не зависит от состояния data/state.json.
+    if config.admin_id is not None:
+        try:
+            await _send(
+                bot,
+                config.admin_id,
+                "✅ <b>Monitoring started</b>\nWatching status.claude.com for "
+                "RSS incident updates.",
+            )
+        except Exception:
+            logger.exception("Не удалось отправить стартовый пинг админу")
 
     while True:
         try:

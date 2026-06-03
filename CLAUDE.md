@@ -53,17 +53,23 @@ docker run -d --restart unless-stopped --env-file .env -v "$(pwd)/data:/app/data
 `message_id`, `resolved_message_id`. Старые ключи `incidents`, `maintenances`, `components`
 могут оставаться в файле как legacy, но не должны создавать Telegram-события.
 
-Первый RSS-запуск засевает ленту молча. Это важно при миграции со старого JSON-state: наличие
-`initialized: true` без `rss_initialized` не должно разослать всю RSS-историю. На первом запуске
-при заданном `CHAT_ID` уходит один стартовый пинг «Monitoring started» — без `CHAT_ID` бот молча
-работает в command-only режиме (события логируются с warning, но не шлются).
+Первый RSS-запуск засевает ленту молча и **в чат `CHAT_ID` ничего не шлёт**. Это важно при
+миграции со старого JSON-state: наличие `initialized: true` без `rss_initialized` не должно
+разослать всю RSS-историю. Без `CHAT_ID` бот работает в command-only режиме (события логируются
+с warning, но не шлются).
+
+Служебный пинг «Monitoring started» уходит **админу (`ADMIN_ID`) в личку при каждом старте
+процесса** — он живёт в `run_poller` (до цикла `while`), а не в ветке первого запуска, и не
+зависит от `data/state.json`. Поэтому потеря state не приводит к спаму в группу. Отправка
+обёрнута в try/except: недоступность админа (например, не открыт диалог с ботом) не валит поллер.
 
 ## Config (.env)
 
 `load_config` (`config.py`) валидирует окружение и кидает `ConfigError` (→ `SystemExit(1)`):
-`BOT_TOKEN` обязателен; `CHAT_ID` опционален (без него — только команды); `POLL_INTERVAL`
-секунды (default 120); `DISPLAY_TIMEZONE` проверяется через `zoneinfo` (default UTC). Есть также
-`AGENTS.md` с гайдлайнами по стилю/коммитам/PR.
+`BOT_TOKEN` обязателен; `CHAT_ID` опционален (без него — только команды); `ADMIN_ID` опционален
+(получатель стартового пинга; без него пинг не шлётся); `POLL_INTERVAL` секунды (default 120);
+`DISPLAY_TIMEZONE` проверяется через `zoneinfo` (default UTC). Есть также `AGENTS.md` с
+гайдлайнами по стилю/коммитам/PR.
 
 ## Testing notes
 
