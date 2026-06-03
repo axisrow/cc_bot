@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import html
 import logging
+import re
 from dataclasses import dataclass
+from xml.etree import ElementTree
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://status.claude.com/api/v2"
+RSS_URL = "https://status.claude.com/history.rss"
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
-
-
-def latest_update(item: dict) -> dict | None:
-    """Последнее (новейшее) обновление инцидента/работы. API отдаёт его первым."""
-    updates = item.get("incident_updates") or []
-    return updates[0] if updates else None
+_INCIDENT_ID_RE = re.compile(r"/incidents/([^/?#]+)")
+_RSS_UPDATE_RE = re.compile(
+    r"<p>\s*<small>(?P<when>.*?)</small>\s*<br>\s*"
+    r"<strong>(?P<status>.*?)</strong>\s*-\s*(?P<body>.*?)\s*</p>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 @dataclass
@@ -30,6 +34,76 @@ class StatusSnapshot:
     components: list[dict]
     incidents: list[dict]
     maintenances: list[dict]
+
+
+@dataclass(frozen=True)
+class RssItem:
+    """Один item из Statuspage RSS: именно он создаёт Telegram-событие."""
+
+    guid: str
+    link: str
+    title: str
+    pub_date: str
+    description: str
+    incident_id: str | None
+    latest_status: str
+    latest_body: str
+
+
+def _text(node: ElementTree.Element, name: str) -> str:
+    child = node.find(name)
+    return (child.text or "").strip() if child is not None else ""
+
+
+def _strip_html(value: str) -> str:
+    return html.unescape(_HTML_TAG_RE.sub("", value)).strip()
+
+
+def _incident_id_from_url(value: str) -> str | None:
+    match = _INCIDENT_ID_RE.search(value)
+    return match.group(1) if match else None
+
+
+def _latest_rss_update(description: str) -> tuple[str, str]:
+    """Вернуть (status, body) из первого блока RSS description.
+
+    RSS item хранит историю обновлений целиком, новейший блок идёт первым.
+    """
+    match = _RSS_UPDATE_RE.search(description)
+    if not match:
+        return "", _strip_html(description)
+    return _strip_html(match.group("status")), _strip_html(match.group("body"))
+
+
+def parse_rss_items(xml_text: str) -> list[RssItem]:
+    """Разобрать Statuspage RSS в список item-ов без сетевых зависимостей."""
+    root = ElementTree.fromstring(xml_text)
+    items: list[RssItem] = []
+    for node in root.findall("./channel/item"):
+        guid = _text(node, "guid")
+        link = _text(node, "link")
+        title = _text(node, "title")
+        pub_date = _text(node, "pubDate")
+        description = _text(node, "description")
+        status, body = _latest_rss_update(description)
+        item_id = _incident_id_from_url(guid) or _incident_id_from_url(link)
+        if not guid:
+            guid = link or title
+        if not guid:
+            continue
+        items.append(
+            RssItem(
+                guid=guid,
+                link=link,
+                title=title,
+                pub_date=pub_date,
+                description=description,
+                incident_id=item_id,
+                latest_status=status,
+                latest_body=body,
+            )
+        )
+    return items
 
 
 def build_snapshot(
@@ -46,25 +120,6 @@ def build_snapshot(
     )
 
 
-def summary_marker(summary: dict) -> str:
-    """Стабильная подпись summary.json — меняется только при реальном событии.
-
-    Основа — page.updated_at (это время последнего события, а не запроса), плюс
-    индикатор и статусы компонентов/активных инцидентов и работ как подстраховка.
-    Поллер сравнивает подпись с прошлой, чтобы не дёргать тяжёлые эндпоинты зря.
-    """
-    page = summary.get("page") or {}
-    status = summary.get("status") or {}
-    parts = [str(page.get("updated_at")), str(status.get("indicator"))]
-    for c in summary.get("components", []):
-        parts.append(f"c:{c.get('id')}={c.get('status')}")
-    for i in summary.get("incidents", []):
-        parts.append(f"i:{i.get('id')}={(latest_update(i) or {}).get('id')}:{i.get('status')}")
-    for m in summary.get("scheduled_maintenances", []):
-        parts.append(f"m:{m.get('id')}={(latest_update(m) or {}).get('id')}:{m.get('status')}")
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
-
-
 class StatusClient:
     """Тонкая обёртка над тремя эндпоинтами Statuspage."""
 
@@ -78,12 +133,17 @@ class StatusClient:
             resp.raise_for_status()
             return await resp.json()
 
-    async def fetch_summary(self) -> dict:
-        """Лёгкий запрос: только summary.json (компоненты + общий статус, ~2 КБ).
+    async def _get_text_url(self, url: str) -> str:
+        async with self._session.get(url, timeout=_TIMEOUT) as resp:
+            resp.raise_for_status()
+            return await resp.text()
 
-        Поллер опрашивает его каждый цикл и по summary_marker решает, нужно ли
-        вообще тянуть тяжёлые эндпоинты.
-        """
+    async def fetch_rss(self) -> list[RssItem]:
+        """Получить RSS history feed. RSS — единственный источник событий."""
+        return parse_rss_items(await self._get_text_url(RSS_URL))
+
+    async def fetch_summary(self) -> dict:
+        """Лёгкий запрос: summary.json для текущей сводки и JSON enrichment."""
         return await self._get_json("summary.json")
 
     async def fetch_details(self) -> tuple[list[dict], list[dict]]:

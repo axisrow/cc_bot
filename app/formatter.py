@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 from app.differ import Event
-from app.status_client import StatusSnapshot, latest_update
+from app.status_client import RssItem, StatusSnapshot
 
 # Эмодзи по серьёзности инцидента
 _IMPACT_EMOJI = {
@@ -16,15 +17,6 @@ _IMPACT_EMOJI = {
     "minor": "🟡",
     "maintenance": "🛠",
     "none": "🔵",
-}
-
-# Эмодзи по статусу компонента
-_COMPONENT_EMOJI = {
-    "operational": "✅",
-    "degraded_performance": "🟡",
-    "partial_outage": "🟠",
-    "major_outage": "🔴",
-    "under_maintenance": "🛠",
 }
 
 # Эмодзи общего индикатора статус-страницы
@@ -70,97 +62,73 @@ def _fmt_time(value: str | None, tz: ZoneInfo) -> str:
         return value
 
 
-def _latest_update_body(item: dict) -> tuple[str, str]:
-    """Вернуть (текст последнего обновления, его время)."""
-    update = latest_update(item)
-    if not update:
-        return "", ""
-    return update.get("body", ""), update.get("created_at", "")
+def _fmt_rss_time(value: str | None, tz: ZoneInfo) -> str:
+    """RFC 2822 pubDate -> 'YYYY-MM-DD HH:MM TZ'."""
+    if not value:
+        return ""
+    try:
+        dt = parsedate_to_datetime(value)
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M %Z")
+    except (ValueError, TypeError):
+        return value
+
+
+def _find_json_incident(item: RssItem, snapshot: StatusSnapshot | None) -> dict | None:
+    if snapshot is None or item.incident_id is None:
+        return None
+    for incident in snapshot.incidents:
+        if incident.get("id") == item.incident_id:
+            return incident
+    return None
+
+
+def _json_or_rss_status(item: RssItem, json_item: dict | None) -> str:
+    # RSS owns the resolved transition; JSON can briefly lag behind it.
+    rss = (item.latest_status or "").strip()
+    if rss.lower() == "resolved":
+        return "resolved"
+    return (json_item or {}).get("status") or rss.lower()
 
 
 def _format_incident(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = None) -> str:
-    item = event.obj
-    impact = item.get("impact", "none")
-    resolved = item.get("status") == "resolved"
+    item = event.item
+    json_item = _find_json_incident(item, snapshot)
+    impact = (json_item or {}).get("impact") or "unknown"
+    status = _json_or_rss_status(item, json_item)
+    resolved = status == "resolved"
 
     if resolved:
         emoji = "✅"
         prefix = "Incident resolved"
     else:
         emoji = _IMPACT_EMOJI.get(impact, "🔵")
-        prefix = "New incident" if event.action == "new" else "Incident update"
+        prefix = "New incident" if event.action == "send" else "Incident update"
 
-    body, when = _latest_update_body(item)
     lines = [
-        f"{emoji} <b>[{prefix}] {_esc(item.get('name'))}</b>",
-        f"Impact: <b>{_esc(impact)}</b> · Status: <b>{_esc(_pretty_status(item.get('status')))}</b>",
+        f"{emoji} <b>[{prefix}] {_esc(item.title)}</b>",
+        f"Impact: <b>{_esc(impact)}</b> · Status: <b>{_esc(_pretty_status(status))}</b>",
     ]
-    if body:
+    if item.latest_body:
         lines.append("")
-        lines.append(_esc(body))
-    # Хвост: при resolved сначала актуальный общий статус страницы
-    # («All Systems Operational», если всё восстановилось), затем время — вплотную.
+        lines.append(_esc(item.latest_body))
     tail = []
-    if resolved and snapshot is not None:
-        overall_emoji, overall_desc = _overall_header(snapshot)
-        tail.append(f"{overall_emoji} <b>{_esc(overall_desc)}</b>")
-    if when:
-        tail.append(f"🕒 {_esc(_fmt_time(when, tz))}")
+    if item.pub_date:
+        tail.append(f"🕒 {_esc(_fmt_rss_time(item.pub_date, tz))}")
     if tail:
         lines.append("")
         lines.extend(tail)
-    shortlink = item.get("shortlink")
-    if shortlink:
-        lines.append(f"🔗 {_esc(shortlink)}")
+    link = (json_item or {}).get("shortlink") or item.link
+    if link:
+        lines.append(f"🔗 {_esc(link)}")
     return "\n".join(lines)
-
-
-def _format_maintenance(event: Event, tz: ZoneInfo) -> str:
-    item = event.obj
-    prefix = "New maintenance" if event.action == "new" else "Maintenance update"
-
-    body, _ = _latest_update_body(item)
-    lines = [
-        f"🛠 <b>[{prefix}] {_esc(item.get('name'))}</b>",
-        f"Status: <b>{_esc(_pretty_status(item.get('status')))}</b>",
-    ]
-    scheduled_for = _fmt_time(item.get("scheduled_for"), tz)
-    scheduled_until = _fmt_time(item.get("scheduled_until"), tz)
-    if scheduled_for or scheduled_until:
-        lines.append(f"🗓 {_esc(scheduled_for)} → {_esc(scheduled_until)}")
-    if body:
-        lines.append("")
-        lines.append(_esc(body))
-    shortlink = item.get("shortlink")
-    if shortlink:
-        lines.append(f"🔗 {_esc(shortlink)}")
-    return "\n".join(lines)
-
-
-def _format_component(event: Event) -> str:
-    item = event.obj
-    old_emoji = _COMPONENT_EMOJI.get(event.old_status or "", "•")
-    new_emoji = _COMPONENT_EMOJI.get(event.new_status or "", "•")
-    return (
-        f"⚙️ <b>{_esc(item.get('name'))}</b>\n"
-        f"{old_emoji} {_esc(_pretty_status(event.old_status))} "
-        f"→ {new_emoji} {_esc(_pretty_status(event.new_status))}"
-    )
 
 
 def format_event(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = None) -> str:
     """Сформировать HTML-сообщение для одного события.
 
-    snapshot нужен только для инцидентов: при resolved к сообщению добавляется
-    строка общего статуса страницы. Для остальных видов он не используется.
+    RSS создаёт событие, snapshot нужен только для JSON enrichment.
     """
-    if event.kind == "incident":
-        return _format_incident(event, tz, snapshot)
-    if event.kind == "maintenance":
-        return _format_maintenance(event, tz)
-    if event.kind == "component":
-        return _format_component(event)
-    return _esc(str(event.obj.get("name", "")))
+    return _format_incident(event, tz, snapshot)
 
 
 def _overall_header(snapshot: StatusSnapshot) -> tuple[str, str]:
@@ -187,7 +155,7 @@ def _overall_header(snapshot: StatusSnapshot) -> tuple[str, str]:
 
 
 def format_overall(snapshot: StatusSnapshot, tz: ZoneInfo) -> str:
-    """Сводка текущего состояния для команды /status."""
+    """Сводка текущего состояния для команды /test."""
     active_incidents = [
         i for i in snapshot.incidents if i.get("status") != "resolved"
     ]

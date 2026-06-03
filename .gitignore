@@ -20,3 +20,4 @@ venv/
 
 # Claude Code (локальные персональные настройки)
 .claude/settings.local.json
+AGENTS.md

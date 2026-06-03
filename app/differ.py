@@ -1,101 +1,85 @@
-"""Чистая логика сравнения: снимок API + старое состояние -> список событий.
+"""Чистая логика RSS-событий: RSS feed + старое состояние -> действия.
 
-Не зависит ни от Telegram, ни от сети — легко тестируется офлайн.
+JSON Statuspage не создаёт события. Он используется только позже, при форматировании,
+чтобы обогатить RSS item impact/status/icon.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from app.status_client import StatusSnapshot, latest_update
+from app.status_client import RssItem
 
 
-@dataclass
+@dataclass(frozen=True)
 class Event:
-    """Одно событие, о котором нужно уведомить."""
+    """Действие, которое поллер должен выполнить в Telegram."""
 
-    kind: str  # "incident" | "maintenance" | "component"
-    action: str  # "new" | "update" (для incident/maintenance); "changed" (для component)
-    obj: dict[str, Any] = field(default_factory=dict)
-    old_status: str | None = None  # только для component
-    new_status: str | None = None  # только для component
+    action: str  # "send" | "edit" | "send_resolved"
+    item: RssItem
+    message_id: int | None = None
 
 
-def _latest_update_id(item: dict[str, Any]) -> str | None:
-    update = latest_update(item)
-    if update is None:
-        # запасной ключ изменения, если обновлений нет
-        return item.get("updated_at")
-    return update.get("id")
+def _is_resolved(status: str | None) -> bool:
+    return (status or "").strip().lower() == "resolved"
+
+
+def _entry(item: RssItem, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    previous = previous or {}
+    return {
+        "pub_date": item.pub_date,
+        "message_id": previous.get("message_id"),
+        "resolved_message_id": previous.get("resolved_message_id"),
+    }
 
 
 def diff(
-    snapshot: StatusSnapshot,
+    items: list[RssItem],
     state: dict[str, Any],
 ) -> tuple[list[Event], dict[str, Any]]:
-    """Сравнить снимок со state и вернуть (события, новое_состояние).
+    """Сравнить RSS items со state и вернуть (действия, новое состояние).
 
-    На первом запуске (в state нет ключа "initialized") события не генерируются —
-    мы лишь засеваем текущие id/статусы, чтобы не спамить историей.
+    Первый RSS-запуск засевает текущую ленту молча. Это важно для миграции со
+    старого JSON-state: если в state нет rss_initialized, историю не рассылаем.
     """
-    initialized = state.get("initialized", False)
-
-    prev_incidents: dict[str, Any] = state.get("incidents", {})
-    prev_maintenances: dict[str, Any] = state.get("maintenances", {})
-    prev_components: dict[str, Any] = state.get("components", {})
-
-    new_incidents: dict[str, Any] = {}
-    new_maintenances: dict[str, Any] = {}
-    new_components: dict[str, Any] = {}
+    initialized = state.get("rss_initialized", False)
+    previous_items: dict[str, dict[str, Any]] = state.get("rss_items", {})
 
     events: list[Event] = []
+    new_items: dict[str, dict[str, Any]] = {}
 
-    def process(items: list[dict], prev: dict, new: dict, kind: str) -> None:
-        # API отдаёт новейшее первым; идём в обратном порядке -> хронологически
-        for item in reversed(items):
-            item_id = item.get("id")
-            if not item_id:
-                continue
-            update_id = _latest_update_id(item)
-            new[item_id] = update_id
-            if not initialized:
-                continue
-            if item_id not in prev:
-                events.append(Event(kind=kind, action="new", obj=item))
-            elif prev[item_id] != update_id:
-                events.append(Event(kind=kind, action="update", obj=item))
+    # RSS отдаёт новейшее первым; отправлять пачку новых событий лучше хронологически.
+    for item in reversed(items):
+        previous = previous_items.get(item.guid)
+        new_items[item.guid] = _entry(item, previous)
 
-    process(snapshot.incidents, prev_incidents, new_incidents, "incident")
-    process(snapshot.maintenances, prev_maintenances, new_maintenances, "maintenance")
-
-    # Компоненты: следим за сменой статуса. Контейнеры-группы пропускаем.
-    for component in snapshot.components:
-        if component.get("group"):
-            continue
-        comp_id = component.get("id")
-        if not comp_id:
-            continue
-        status = component.get("status", "operational")
-        new_components[comp_id] = status
         if not initialized:
             continue
-        old = prev_components.get(comp_id)
-        if old is not None and old != status:
+        if previous is None:
+            action = "send_resolved" if _is_resolved(item.latest_status) else "send"
+            events.append(Event(action=action, item=item))
+            continue
+        if previous.get("pub_date") == item.pub_date:
+            continue
+
+        if _is_resolved(item.latest_status):
+            if previous.get("resolved_message_id") is None:
+                events.append(
+                    Event(
+                        action="send_resolved",
+                        item=item,
+                        message_id=previous.get("message_id"),
+                    )
+                )
+        else:
             events.append(
                 Event(
-                    kind="component",
-                    action="changed",
-                    obj=component,
-                    old_status=old,
-                    new_status=status,
+                    action="edit",
+                    item=item,
+                    message_id=previous.get("message_id"),
                 )
             )
 
-    new_state = {
-        "initialized": True,
-        "incidents": new_incidents,
-        "maintenances": new_maintenances,
-        "components": new_components,
-    }
+    new_state = {**state, "rss_initialized": True, "rss_items": new_items}
     return events, new_state
