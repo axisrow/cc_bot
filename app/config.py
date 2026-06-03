@@ -23,10 +23,22 @@ def _get_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} должно быть целым числом, получено: {raw!r}") from exc
 
 
+def _get_optional_int(name: str) -> int | None:
+    """Целое из env или None, если переменная пуста/не задана."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} должно быть целым числом, получено: {raw!r}") from exc
+
+
 @dataclass(frozen=True)
 class Config:
     token: str
     chat_id: int | None
+    admin_id: int | None
     poll_interval: int
     timezone: ZoneInfo
 
@@ -39,13 +51,8 @@ def load_config() -> Config:
     if not token:
         raise ConfigError("BOT_TOKEN не задан. Получите токен у @BotFather и впишите в .env.")
 
-    chat_id_raw = os.getenv("CHAT_ID", "").strip()
-    chat_id: int | None = None
-    if chat_id_raw:
-        try:
-            chat_id = int(chat_id_raw)
-        except ValueError as exc:
-            raise ConfigError(f"CHAT_ID должен быть числом, получено: {chat_id_raw!r}") from exc
+    chat_id = _get_optional_int("CHAT_ID")
+    admin_id = _get_optional_int("ADMIN_ID")
 
     tz_name = os.getenv("DISPLAY_TIMEZONE", "UTC").strip() or "UTC"
     try:
@@ -56,6 +63,7 @@ def load_config() -> Config:
     return Config(
         token=token,
         chat_id=chat_id,
+        admin_id=admin_id,
         poll_interval=_get_int("POLL_INTERVAL", 120),
         timezone=timezone,
     )
