@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
 
@@ -11,7 +11,6 @@ Telegram-бот на **aiogram 3.x** для `status.claude.com`. Источни�
 ## Commands
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # впишите BOT_TOKEN, при желании CHAT_ID
 
@@ -33,15 +32,20 @@ docker run -d --restart unless-stopped --env-file .env -v "$(pwd)/data:/app/data
 1. `dp.start_polling` — Telegram-команды (`/start`, `/test`) из `app/handlers.py`.
 2. `run_poller` — фоновый RSS poller из `app/poller.py`.
 
-Основной конвейер уведомлений:
+Основной конвейер уведомлений (`poll_once` в `poller.py`):
 
-`StatusClient.fetch_rss()` → `diff()` → `StatusClient.fetch()` для JSON enrichment → `format_event()` → `send_message`/`edit_message_text` → `save_state()`.
+`fetch_rss()` → `diff()` → (если есть события) `fetch()` для JSON enrichment → `format_event()` → `send_message`/`edit_message_text` → `save_state()`.
 
-- **`status_client.py`** — парсит RSS (`RssItem`) и умеет тянуть JSON snapshot для enrichment и `/test`.
-- **`differ.py`** — чистая RSS-логика без сети и Telegram. Возвращает действия `send`, `edit`, `send_resolved`.
-- **`formatter.py`** — текст берёт из RSS, impact/status/icon/shortlink берёт из JSON incident по id из RSS URL.
-- **`poller.py`** — non-resolved RSS updates редактируют сохранённый `message_id`; `Resolved` всегда шлёт новое зелёное сообщение.
-- **`state.py`** — атомарно хранит `data/state.json`.
+- **`status_client.py`** — парсит RSS (`RssItem`, `parse_rss_items` — чистая, без сети) и держит три эндпоинта Statuspage: `fetch_summary` (summary.json), `fetch_details` (incidents.json + scheduled-maintenances.json) и `fetch` (всё параллельно через `asyncio.gather`). `RssItem.incident_id` извлекается regex'ом из URL — это ключ связи RSS↔JSON.
+- **`differ.py`** — чистая RSS-логика без сети и Telegram. Возвращает действия `send`, `edit`, `send_resolved`. JSON здесь не участвует — события рождаются только из RSS.
+- **`formatter.py`** — текст берёт из RSS, impact/status/icon/shortlink берёт из JSON incident, найденного по `incident_id`. Enrichment best-effort: при ошибке JSON (`_fetch_enrichment` → `None`) сообщение уходит RSS-only.
+- **`poller.py`** — non-resolved RSS updates редактируют сохранённый `message_id` (с fallback на новый send, если edit не удался); `Resolved` всегда шлёт новое зелёное сообщение. `_SEND_DELAY` + обработка `TelegramRetryAfter` защищают от rate-limit.
+- **`state.py`** — атомарно (`tempfile` + `os.replace`) хранит `data/state.json`; битый/отсутствующий файл → пустое состояние.
+
+## Formatter invariants (легко сломать)
+
+- **RSS владеет переходом в `resolved`** — JSON-статус инцидента может кратко отставать. `_json_or_rss_status` принудительно возвращает `resolved`, если так сказал RSS, игнорируя JSON.
+- **`/test` переопределяет «зелёный» индикатор** — Statuspage иногда держит общий indicator `none`, пока инцидент ещё не задел компоненты. `_overall_header` при наличии активных инцидентов поднимает заголовок до minor/major/critical, чтобы не показывать ложное «All Systems Operational».
 
 ## State invariants
 
@@ -50,7 +54,16 @@ docker run -d --restart unless-stopped --env-file .env -v "$(pwd)/data:/app/data
 могут оставаться в файле как legacy, но не должны создавать Telegram-события.
 
 Первый RSS-запуск засевает ленту молча. Это важно при миграции со старого JSON-state: наличие
-`initialized: true` без `rss_initialized` не должно разослать всю RSS-историю.
+`initialized: true` без `rss_initialized` не должно разослать всю RSS-историю. На первом запуске
+при заданном `CHAT_ID` уходит один стартовый пинг «Monitoring started» — без `CHAT_ID` бот молча
+работает в command-only режиме (события логируются с warning, но не шлются).
+
+## Config (.env)
+
+`load_config` (`config.py`) валидирует окружение и кидает `ConfigError` (→ `SystemExit(1)`):
+`BOT_TOKEN` обязателен; `CHAT_ID` опционален (без него — только команды); `POLL_INTERVAL`
+секунды (default 120); `DISPLAY_TIMEZONE` проверяется через `zoneinfo` (default UTC). Есть также
+`AGENTS.md` с гайдлайнами по стилю/коммитам/PR.
 
 ## Testing notes
 
