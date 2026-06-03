@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 
-from aiogram import Router
+from aiogram import Bot, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -33,13 +35,30 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.message(Command("test"))
-async def cmd_test(message: Message, config: Config, status_client: StatusClient) -> None:
-    """Прислать текущий статус status.claude.com тому, кто отправил команду."""
+async def cmd_test(
+    message: Message, bot: Bot, config: Config, status_client: StatusClient
+) -> None:
+    """Прислать текущий статус status.claude.com.
+
+    В личке отвечает прямо там; в группе ничего не пишет в чат, а шлёт ответ
+    в личку вызвавшему (если у того открыт диалог с ботом).
+    """
     try:
         snapshot = await status_client.fetch()
     except Exception:
         logger.exception("Не удалось получить статус для /test")
-        await message.answer("⚠️ Не удалось получить данные со status.claude.com. Попробуйте позже.")
+        text = "⚠️ Не удалось получить данные со status.claude.com. Попробуйте позже."
+    else:
+        text = format_overall(snapshot, config.timezone)
+
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
         return
 
-    await message.answer(format_overall(snapshot, config.timezone))
+    user = message.from_user
+    if user is None:
+        return
+    try:
+        await bot.send_message(user.id, text)
+    except TelegramForbiddenError:
+        logger.info("Не могу ответить на /test в личку %s — диалог с ботом не открыт", user.id)
