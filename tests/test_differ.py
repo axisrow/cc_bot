@@ -233,10 +233,12 @@ def test_format_overall_lists_active_json_incidents_for_test_command():
 class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.sent_threads: list[int | None] = []
         self.edited: list[tuple[int, int, str]] = []
 
-    async def send_message(self, chat_id: int, text: str):
+    async def send_message(self, chat_id: int, text: str, message_thread_id: int | None = None):
         self.sent.append((chat_id, text))
+        self.sent_threads.append(message_thread_id)
         return SimpleNamespace(message_id=100 + len(self.sent))
 
     async def edit_message_text(self, text: str, *, chat_id: int, message_id: int):
@@ -275,7 +277,7 @@ async def test_poller_edits_non_resolved_update(monkeypatch):
     new_state = await poll_once(
         bot,
         FakeClient([updated], snapshot(json_incident(status="monitoring", impact="minor"))),
-        SimpleNamespace(chat_id=1, timezone=UTC),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
         state,
     )
 
@@ -304,7 +306,7 @@ async def test_poller_sends_resolved_as_new_message(monkeypatch):
     new_state = await poll_once(
         bot,
         FakeClient([resolved], snapshot(json_incident(status="resolved", impact="minor"))),
-        SimpleNamespace(chat_id=1, timezone=UTC),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
         state,
     )
 
@@ -314,6 +316,30 @@ async def test_poller_sends_resolved_as_new_message(monkeypatch):
     assert "Incident resolved" in bot.sent[0][1]
     assert new_state["rss_items"][resolved.guid]["resolved_message_id"] == 101
     assert saved
+
+
+@pytest.mark.asyncio
+async def test_poller_sends_to_configured_topic(monkeypatch):
+    """Новое уведомление уходит в топик из MESSAGE_THREAD_ID, а не в General."""
+    old_item = rss_item()
+    state = seed_state(old_item)
+    new_item = rss_item(
+        guid="https://status.claude.com/incidents/inc_2",
+        title="Login failures",
+        incident_id="inc_2",
+    )
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    bot = FakeBot()
+    await poll_once(
+        bot,
+        FakeClient([new_item, old_item], snapshot(json_incident())),
+        SimpleNamespace(chat_id=1, message_thread_id=3527, timezone=UTC),
+        state,
+    )
+
+    assert len(bot.sent) == 1
+    assert bot.sent_threads == [3527]
 
 
 @pytest.mark.asyncio
@@ -332,7 +358,7 @@ async def test_poller_ignores_json_component_changes_without_rss_event(monkeypat
     )
 
     bot = FakeBot()
-    await poll_once(bot, client, SimpleNamespace(chat_id=1, timezone=UTC), state)
+    await poll_once(bot, client, SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC), state)
 
     assert bot.sent == []
     assert bot.edited == []
@@ -352,7 +378,7 @@ async def test_poller_first_run_seeds_silently(monkeypatch):
     new_state = await poll_once(
         bot,
         client,
-        SimpleNamespace(chat_id=1, timezone=UTC),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
         empty_state(),
     )
 

@@ -38,6 +38,7 @@ def _get_optional_int(name: str) -> int | None:
 class Config:
     token: str
     chat_id: int | None
+    message_thread_id: int | None
     admin_id: int | None
     poll_interval: int
     timezone: ZoneInfo
@@ -52,6 +53,7 @@ def load_config() -> Config:
         raise ConfigError("BOT_TOKEN не задан. Получите токен у @BotFather и впишите в .env.")
 
     chat_id = _get_optional_int("CHAT_ID")
+    message_thread_id = _get_optional_int("MESSAGE_THREAD_ID")
     admin_id = _get_optional_int("ADMIN_ID")
 
     tz_name = os.getenv("DISPLAY_TIMEZONE", "UTC").strip() or "UTC"
@@ -63,6 +65,7 @@ def load_config() -> Config:
     return Config(
         token=token,
         chat_id=chat_id,
+        message_thread_id=message_thread_id,
         admin_id=admin_id,
         poll_interval=_get_int("POLL_INTERVAL", 120),
         timezone=timezone,

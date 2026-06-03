@@ -63,12 +63,17 @@ docker run -d --restart unless-stopped --env-file .env -v "$(pwd)/data:/app/data
 зависит от `data/state.json`. Поэтому потеря state не приводит к спаму в группу. Отправка
 обёрнута в try/except: недоступность админа (например, не открыт диалог с ботом) не валит поллер.
 
+Уведомления об инцидентах уходят в топик `MESSAGE_THREAD_ID` (если задан) — `_send` принимает
+`thread_id`, `_edit` его не требует (`message_id` уже адресует сообщение в его топике). Стартовый
+пинг админу и команда `/test` в группе шлют в **личку без thread_id** — у лички топиков нет.
+
 ## Config (.env)
 
 `load_config` (`config.py`) валидирует окружение и кидает `ConfigError` (→ `SystemExit(1)`):
-`BOT_TOKEN` обязателен; `CHAT_ID` опционален (без него — только команды); `ADMIN_ID` опционален
-(получатель стартового пинга; без него пинг не шлётся); `POLL_INTERVAL` секунды (default 120);
-`DISPLAY_TIMEZONE` проверяется через `zoneinfo` (default UTC). Есть также `AGENTS.md` с
+`BOT_TOKEN` обязателен; `CHAT_ID` опционален (без него — только команды); `MESSAGE_THREAD_ID`
+опционален (id топика форум-группы, куда слать уведомления; без него — в General); `ADMIN_ID`
+опционален (получатель стартового пинга; без него пинг не шлётся); `POLL_INTERVAL` секунды
+(default 120); `DISPLAY_TIMEZONE` проверяется через `zoneinfo` (default UTC). Есть также `AGENTS.md` с
 гайдлайнами по стилю/коммитам/PR.
 
 ## Testing notes

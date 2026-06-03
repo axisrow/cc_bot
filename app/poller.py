@@ -20,19 +20,26 @@ logger = logging.getLogger(__name__)
 _SEND_DELAY = 0.5
 
 
-async def _send(bot: Bot, chat_id: int, text: str) -> int:
-    """Отправить сообщение с обработкой rate-limit (429)."""
+async def _send(bot: Bot, chat_id: int, text: str, thread_id: int | None = None) -> int:
+    """Отправить сообщение с обработкой rate-limit (429).
+
+    thread_id направляет сообщение в топик форум-группы; None — в General/личку.
+    """
     try:
-        message = await bot.send_message(chat_id, text)
+        message = await bot.send_message(chat_id, text, message_thread_id=thread_id)
     except TelegramRetryAfter as exc:
         logger.warning("Rate limit, ждём %s c", exc.retry_after)
         await asyncio.sleep(exc.retry_after)
-        message = await bot.send_message(chat_id, text)
+        message = await bot.send_message(chat_id, text, message_thread_id=thread_id)
     return message.message_id
 
 
 async def _edit(bot: Bot, chat_id: int, message_id: int, text: str) -> bool:
-    """Отредактировать сообщение. False означает, что нужен fallback send."""
+    """Отредактировать сообщение. False означает, что нужен fallback send.
+
+    message_thread_id для edit не нужен — message_id уже однозначно адресует
+    сообщение в его топике.
+    """
     try:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
         return True
@@ -93,7 +100,9 @@ async def poll_once(
             # edit с известным message_id редактирует исходное сообщение; если он
             # не удался (или это send/send_resolved) — шлём новое и запоминаем id.
             if not (is_edit and await _edit(bot, config.chat_id, event.message_id, text)):
-                message_id = await _send(bot, config.chat_id, text)
+                message_id = await _send(
+                    bot, config.chat_id, text, config.message_thread_id
+                )
                 _record_message_id(new_state, event, message_id)
             await asyncio.sleep(_SEND_DELAY)
     elif events:
