@@ -15,8 +15,8 @@ STATE_FILE = "data/state.json"
 
 
 def empty_state() -> dict[str, Any]:
-    """Пустое состояние до первого запуска (initialized отсутствует)."""
-    return {"incidents": {}, "maintenances": {}, "components": {}}
+    """Пустое состояние до первого запуска (rss_initialized отсутствует)."""
+    return {"rss_items": {}}
 
 
 def load_state(path: str = STATE_FILE) -> dict[str, Any]:

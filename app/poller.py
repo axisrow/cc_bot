@@ -6,13 +6,13 @@ import asyncio
 import logging
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from app.config import Config
-from app.differ import diff
+from app.differ import Event, diff
 from app.formatter import format_event
 from app.state import load_state, save_state
-from app.status_client import StatusClient, build_snapshot, summary_marker
+from app.status_client import StatusClient, StatusSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +20,48 @@ logger = logging.getLogger(__name__)
 _SEND_DELAY = 0.5
 
 
-async def _send(bot: Bot, chat_id: int, text: str) -> None:
+async def _send(bot: Bot, chat_id: int, text: str) -> int:
     """Отправить сообщение с обработкой rate-limit (429)."""
     try:
-        await bot.send_message(chat_id, text)
+        message = await bot.send_message(chat_id, text)
     except TelegramRetryAfter as exc:
         logger.warning("Rate limit, ждём %s c", exc.retry_after)
         await asyncio.sleep(exc.retry_after)
-        await bot.send_message(chat_id, text)
+        message = await bot.send_message(chat_id, text)
+    return message.message_id
+
+
+async def _edit(bot: Bot, chat_id: int, message_id: int, text: str) -> bool:
+    """Отредактировать сообщение. False означает, что нужен fallback send."""
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+        return True
+    except TelegramRetryAfter as exc:
+        logger.warning("Rate limit на edit, ждём %s c", exc.retry_after)
+        await asyncio.sleep(exc.retry_after)
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+        return True
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        logger.warning("Не удалось отредактировать message_id=%s: %s", message_id, exc)
+        return False
+
+
+async def _fetch_enrichment(client: StatusClient) -> StatusSnapshot | None:
+    try:
+        return await client.fetch()
+    except Exception:
+        logger.exception("Не удалось получить JSON enrichment, отправляю RSS-only")
+        return None
+
+
+def _record_message_id(state: dict, event: Event, message_id: int) -> None:
+    entry = state.setdefault("rss_items", {}).setdefault(event.item.guid, {})
+    if event.action == "send_resolved":
+        entry["resolved_message_id"] = message_id
+    else:
+        entry["message_id"] = message_id
 
 
 async def poll_once(
@@ -36,50 +70,44 @@ async def poll_once(
     config: Config,
     state: dict,
 ) -> dict:
-    """Один цикл опроса: summary -> (гейт) -> diff -> отправка -> новое состояние."""
-    summary = await client.fetch_summary()
-    marker = summary_marker(summary)
-    was_initialized = state.get("initialized", False)
-
-    # Гейт: если уже инициализированы и summary не менялся — тяжёлые эндпоинты
-    # (incidents.json ~200 КБ + работы) не дёргаем, событий всё равно быть не может.
-    if was_initialized and marker == state.get("summary_marker"):
-        logger.debug("summary не менялся — пропускаю тяжёлый опрос")
-        return state
-
-    incidents, maintenances = await client.fetch_details()
-    snapshot = build_snapshot(summary, incidents, maintenances)
-
-    events, new_state = diff(snapshot, state)
-    new_state["summary_marker"] = marker
+    """Один цикл опроса: RSS -> diff -> send/edit -> новое состояние."""
+    rss_items = await client.fetch_rss()
+    was_initialized = state.get("rss_initialized", False)
+    events, new_state = diff(rss_items, state)
 
     if not was_initialized:
-        # Первый запуск: молча засеваем состояние, один стартовый пинг.
+        # Первый RSS-запуск: молча засеваем ленту, один стартовый пинг.
         save_state(new_state)
         logger.info(
-            "Первый запуск: засеяно %d инцидентов, %d работ, %d компонентов",
-            len(new_state["incidents"]),
-            len(new_state["maintenances"]),
-            len(new_state["components"]),
+            "Первый RSS-запуск: засеяно %d item-ов",
+            len(new_state["rss_items"]),
         )
         if config.chat_id is not None:
             await _send(
                 bot,
                 config.chat_id,
                 "✅ <b>Monitoring started</b>\nWatching status.claude.com for "
-                "incidents, maintenance and component changes.",
+                "RSS incident updates.",
             )
         return new_state
 
     if events and config.chat_id is not None:
-        logger.info("Отправляю %d уведомлений", len(events))
+        snapshot = await _fetch_enrichment(client)
+        logger.info("Обрабатываю %d RSS-событий", len(events))
         for event in events:
-            await _send(bot, config.chat_id, format_event(event, config.timezone, snapshot))
+            text = format_event(event, config.timezone, snapshot)
+            is_edit = event.action == "edit" and event.message_id is not None
+            # edit с известным message_id редактирует исходное сообщение; если он
+            # не удался (или это send/send_resolved) — шлём новое и запоминаем id.
+            if not (is_edit and await _edit(bot, config.chat_id, event.message_id, text)):
+                message_id = await _send(bot, config.chat_id, text)
+                _record_message_id(new_state, event, message_id)
             await asyncio.sleep(_SEND_DELAY)
     elif events:
         logger.warning("Есть %d событий, но CHAT_ID не задан — не отправляю", len(events))
 
-    save_state(new_state)
+    if new_state != state:
+        save_state(new_state)
     return new_state
 
 

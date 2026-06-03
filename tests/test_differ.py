@@ -1,282 +1,339 @@
-"""Офлайн-тесты логики диффа и форматтера (без Telegram и сети)."""
+"""Офлайн-тесты RSS-first логики уведомлений (без Telegram и сети)."""
 
 from __future__ import annotations
 
 import copy
-import json
-from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from app.differ import Event, diff
 from app.formatter import format_event, format_overall
+from app.poller import poll_once
 from app.state import empty_state
-from app.status_client import StatusSnapshot, summary_marker
+from app.status_client import RssItem, StatusSnapshot, parse_rss_items
 
-FIXTURE = Path(__file__).parent / "fixtures" / "sample.json"
 UTC = ZoneInfo("UTC")
 
 
-def load_snapshot() -> StatusSnapshot:
-    data = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    return StatusSnapshot(
-        indicator=data["indicator"],
-        description=data["description"],
-        components=data["components"],
-        incidents=data["incidents"],
-        maintenances=data["maintenances"],
+def rss_item(
+    *,
+    guid: str = "https://status.claude.com/incidents/inc_1",
+    title: str = "Elevated API error rates",
+    pub_date: str = "Wed, 03 Jun 2026 07:10:01 +0000",
+    status: str = "Investigating",
+    body: str = "We are currently investigating this issue.",
+    incident_id: str = "inc_1",
+) -> RssItem:
+    return RssItem(
+        guid=guid,
+        link=guid,
+        title=title,
+        pub_date=pub_date,
+        description="",
+        incident_id=incident_id,
+        latest_status=status,
+        latest_body=body,
     )
 
 
-def seed_state(snapshot: StatusSnapshot) -> dict:
-    """Получить состояние после первого (засевающего) опроса."""
-    _, state = diff(snapshot, empty_state())
-    return state
-
-
-# --- Первый запуск -----------------------------------------------------------
-
-def test_first_run_seeds_without_events():
-    snapshot = load_snapshot()
-    events, state = diff(snapshot, empty_state())
-
-    assert events == []  # на первом запуске не спамим историей
-    assert state["initialized"] is True
-    assert state["incidents"] == {"inc_1": "upd_2"}  # новейшее обновление
-    assert state["maintenances"] == {"mnt_1": "mupd_1"}
-    # группа grp_root отфильтрована, остались только листовые компоненты
-    assert state["components"] == {
-        "comp_api": "operational",
-        "comp_web": "degraded_performance",
-    }
-
-
-def test_no_changes_no_events():
-    snapshot = load_snapshot()
-    state = seed_state(snapshot)
-    events, _ = diff(snapshot, state)
-    assert events == []
-
-
-# --- Инциденты ----------------------------------------------------------------
-
-def test_new_incident_emits_event():
-    snapshot = load_snapshot()
-    state = seed_state(snapshot)
-
-    new = copy.deepcopy(snapshot)
-    new.incidents = new.incidents + [
-        {
-            "id": "inc_2",
-            "name": "Login failures",
-            "status": "identified",
-            "impact": "critical",
-            "incident_updates": [
-                {"id": "u9", "status": "identified", "body": "Root cause found.",
-                 "created_at": "2026-06-02T11:00:00Z"}
-            ],
-        }
-    ]
-
-    events, _ = diff(new, state)
-    assert len(events) == 1
-    assert events[0].kind == "incident"
-    assert events[0].action == "new"
-    assert events[0].obj["id"] == "inc_2"
-
-
-def test_incident_update_emits_event():
-    snapshot = load_snapshot()
-    state = seed_state(snapshot)
-
-    new = copy.deepcopy(snapshot)
-    new.incidents[0]["status"] = "monitoring"
-    new.incidents[0]["incident_updates"].insert(
-        0,
-        {"id": "upd_3", "status": "monitoring", "body": "Fix deployed, monitoring.",
-         "created_at": "2026-06-02T10:30:00Z"},
-    )
-
-    events, _ = diff(new, state)
-    assert len(events) == 1
-    assert events[0].kind == "incident"
-    assert events[0].action == "update"
-
-
-# --- Работы -------------------------------------------------------------------
-
-def test_maintenance_update_emits_event():
-    snapshot = load_snapshot()
-    state = seed_state(snapshot)
-
-    new = copy.deepcopy(snapshot)
-    new.maintenances[0]["status"] = "in_progress"
-    new.maintenances[0]["incident_updates"].insert(
-        0,
-        {"id": "mupd_2", "status": "in_progress", "body": "Maintenance has begun.",
-         "created_at": "2026-06-05T01:00:00Z"},
-    )
-
-    events, _ = diff(new, state)
-    assert len(events) == 1
-    assert events[0].kind == "maintenance"
-    assert events[0].action == "update"
-
-
-# --- Компоненты ---------------------------------------------------------------
-
-def test_component_status_change_emits_event():
-    snapshot = load_snapshot()
-    state = seed_state(snapshot)
-
-    new = copy.deepcopy(snapshot)
-    new.components[0]["status"] = "major_outage"  # comp_api: operational -> major_outage
-
-    events, _ = diff(new, state)
-    assert len(events) == 1
-    ev = events[0]
-    assert ev.kind == "component"
-    assert ev.old_status == "operational"
-    assert ev.new_status == "major_outage"
-
-
-# --- Форматтер ----------------------------------------------------------------
-
-def test_format_incident_escapes_html():
-    snapshot = load_snapshot()
-    event = Event(kind="incident", action="new", obj=snapshot.incidents[0])
-    text = format_event(event, UTC)
-
-    assert "Elevated API error rates" in text
-    assert "🔗" in text
-    # тело содержит <looking> — должно быть экранировано
-    assert "&lt;looking&gt;" in text
-    assert "<looking>" not in text
-
-
-def test_format_component():
-    event = Event(
-        kind="component",
-        action="changed",
-        obj={"name": "API"},
-        old_status="operational",
-        new_status="major_outage",
-    )
-    text = format_event(event, UTC)
-    assert "API" in text
-    assert "Operational" in text
-    assert "Major outage" in text
-
-
-def test_format_overall_lists_active():
-    snapshot = load_snapshot()
-    text = format_overall(snapshot, UTC)
-    assert "Partially Degraded Service" in text
-    assert "Elevated API error rates" in text
-    assert "Database upgrade" in text
-
-
-def test_format_overall_green_indicator_with_active_incident():
-    """Индикатор страницы 'none', но инцидент открыт — заголовок не должен врать."""
-    snapshot = load_snapshot()
-    snapshot.indicator = "none"
-    snapshot.description = "All Systems Operational"
-    snapshot.maintenances = []  # оставляем только инцидент major
-
-    text = format_overall(snapshot, UTC)
-    first_line = text.splitlines()[0]
-    assert "All Systems Operational" not in first_line
-    assert "✅" not in first_line  # зелёная галка убрана
-    assert "Partial System Outage" in first_line  # impact инцидента — major
-    assert "Elevated API error rates" in text
-
-
-# --- Resolved-инцидент: зелёная галка + общий статус -------------------------
-
-def _resolved_snapshot() -> StatusSnapshot:
-    """Снапшот после резолва: инцидент resolved, страница снова operational."""
-    incident = {
-        "id": "inc_done",
-        "name": "Elevated errors on Opus 4.6",
-        "status": "resolved",
-        "impact": "major",
-        "shortlink": "https://stspg.io/j1r06qml3bvy",
-        "incident_updates": [
-            {"id": "u_res", "status": "resolved",
-             "body": "This incident has been resolved.",
-             "created_at": "2026-06-02T11:49:06Z"},
-        ],
-    }
+def snapshot(incident: dict | None = None, components: list[dict] | None = None) -> StatusSnapshot:
     return StatusSnapshot(
         indicator="none",
         description="All Systems Operational",
-        components=[],
-        incidents=[incident],
+        components=components or [],
+        incidents=[incident] if incident else [],
         maintenances=[],
     )
 
 
-def test_format_resolved_incident_shows_operational():
-    snapshot = _resolved_snapshot()
-    event = Event(kind="incident", action="update", obj=snapshot.incidents[0])
-    text = format_event(event, UTC, snapshot)
-
-    assert "✅" in text
-    assert "Incident resolved" in text
-    assert "All Systems Operational" in text
-    # оранжевый impact-эмодзи у resolved появляться не должен
-    assert "🟠" not in text
-
-
-def test_format_resolved_incident_keeps_warning_if_another_active():
-    """Если параллельно открыт другой инцидент — не врём «All Systems Operational»."""
-    snapshot = _resolved_snapshot()
-    snapshot.incidents = snapshot.incidents + [
-        {"id": "inc_open", "name": "Login failures", "status": "investigating",
-         "impact": "major", "incident_updates": []}
-    ]
-    event = Event(kind="incident", action="update", obj=snapshot.incidents[0])
-    text = format_event(event, UTC, snapshot)
-
-    assert "✅" in text  # сам разрешённый инцидент всё равно с галкой
-    assert "All Systems Operational" not in text
-    assert "Partial System Outage" in text  # impact активного инцидента — major
-
-
-# --- Гейт опроса: подпись summary -------------------------------------------
-
-def _sample_summary() -> dict:
+def json_incident(status: str = "investigating", impact: str = "major") -> dict:
     return {
-        "page": {"updated_at": "2026-06-02T12:00:00.000Z"},
-        "status": {"indicator": "none", "description": "All Systems Operational"},
-        "components": [
-            {"id": "comp_api", "status": "operational"},
-            {"id": "comp_web", "status": "degraded_performance"},
-        ],
-        "incidents": [],
-        "scheduled_maintenances": [],
+        "id": "inc_1",
+        "name": "Elevated API error rates",
+        "status": status,
+        "impact": impact,
+        "shortlink": "https://stspg.io/abc",
+        "incident_updates": [],
     }
 
 
-def test_summary_marker_stable_for_same_input():
-    summary = _sample_summary()
-    assert summary_marker(summary) == summary_marker(copy.deepcopy(summary))
+SAMPLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Elevated errors on Opus 4.7</title>
+      <description>
+        &lt;p&gt; &lt;small&gt;Jun &lt;var data-var='date'&gt;3&lt;/var&gt;, &lt;var data-var='time'&gt;07:28&lt;/var&gt; UTC&lt;/small&gt;&lt;br&gt; &lt;strong&gt;Monitoring&lt;/strong&gt; - A fix has been implemented and we are monitoring the results. &lt;/p&gt;
+        &lt;p&gt; &lt;small&gt;Jun &lt;var data-var='date'&gt;3&lt;/var&gt;, &lt;var data-var='time'&gt;07:10&lt;/var&gt; UTC&lt;/small&gt;&lt;br&gt; &lt;strong&gt;Investigating&lt;/strong&gt; - We are currently investigating this issue. &lt;/p&gt;
+      </description>
+      <pubDate>Wed, 03 Jun 2026 07:28:39 +0000</pubDate>
+      <link>https://status.claude.com/incidents/thp2kyjx60qn</link>
+      <guid>https://status.claude.com/incidents/thp2kyjx60qn</guid>
+    </item>
+  </channel>
+</rss>
+"""
 
 
-def test_summary_marker_changes_on_component_status():
-    summary = _sample_summary()
-    before = summary_marker(summary)
-    summary["components"][0]["status"] = "major_outage"
-    assert summary_marker(summary) != before
+def seed_state(item: RssItem) -> dict:
+    _, state = diff([item], empty_state())
+    return state
 
 
-def test_summary_marker_changes_on_page_updated_at():
-    summary = _sample_summary()
-    before = summary_marker(summary)
-    summary["page"]["updated_at"] = "2026-06-02T13:00:00.000Z"
-    assert summary_marker(summary) != before
+# --- RSS parsing -------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+def test_parse_rss_item_uses_latest_description_block():
+    items = parse_rss_items(SAMPLE_RSS)
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.incident_id == "thp2kyjx60qn"
+    assert item.latest_status == "Monitoring"
+    assert item.latest_body == "A fix has been implemented and we are monitoring the results."
+    assert item.pub_date == "Wed, 03 Jun 2026 07:28:39 +0000"
+
+
+# --- RSS diff ----------------------------------------------------------------
+
+
+def test_first_rss_run_seeds_without_events():
+    item = rss_item()
+    events, state = diff([item], empty_state())
+
+    assert events == []
+    assert state["rss_initialized"] is True
+    assert state["rss_items"][item.guid]["pub_date"] == item.pub_date
+    assert state["rss_items"][item.guid]["message_id"] is None
+
+
+def test_legacy_json_state_is_seeded_without_rss_history_spam():
+    item = rss_item()
+    legacy_state = {"initialized": True, "incidents": {"old": "u1"}}
+    events, state = diff([item], legacy_state)
+
+    assert events == []
+    assert state["rss_initialized"] is True
+    assert state["incidents"] == {"old": "u1"}
+
+
+def test_new_rss_guid_emits_send():
+    old_item = rss_item()
+    state = seed_state(old_item)
+    new_item = rss_item(
+        guid="https://status.claude.com/incidents/inc_2",
+        title="Login failures",
+        incident_id="inc_2",
+    )
+
+    events, _ = diff([new_item, old_item], state)
+
+    assert events == [Event(action="send", item=new_item)]
+
+
+def test_new_resolved_rss_guid_emits_send_resolved():
+    old_item = rss_item()
+    state = seed_state(old_item)
+    resolved_item = rss_item(
+        guid="https://status.claude.com/incidents/inc_2",
+        title="Login failures",
+        incident_id="inc_2",
+        status="Resolved",
+        pub_date="Wed, 03 Jun 2026 08:00:00 +0000",
+        body="This incident has been resolved.",
+    )
+
+    events, _ = diff([resolved_item, old_item], state)
+
+    assert events == [Event(action="send_resolved", item=resolved_item)]
+
+
+def test_non_resolved_update_emits_edit_with_message_id():
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42
+    updated = rss_item(
+        pub_date="Wed, 03 Jun 2026 07:28:39 +0000",
+        status="Monitoring",
+        body="A fix has been implemented.",
+    )
+
+    events, new_state = diff([updated], state)
+
+    assert events == [Event(action="edit", item=updated, message_id=42)]
+    assert new_state["rss_items"][updated.guid]["message_id"] == 42
+    assert new_state["rss_items"][updated.guid]["pub_date"] == updated.pub_date
+
+
+def test_resolved_update_emits_new_green_message_once():
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42
+    resolved = rss_item(
+        pub_date="Wed, 03 Jun 2026 08:00:00 +0000",
+        status="Resolved",
+        body="This incident has been resolved.",
+    )
+
+    events, new_state = diff([resolved], state)
+    assert events == [Event(action="send_resolved", item=resolved, message_id=42)]
+
+    new_state["rss_items"][resolved.guid]["resolved_message_id"] = 99
+    repeat_events, _ = diff([resolved], new_state)
+    assert repeat_events == []
+
+
+# --- Formatting --------------------------------------------------------------
+
+
+def test_format_event_uses_json_impact_icon_and_rss_body():
+    item = rss_item(body="We are <looking> into errors.")
+    event = Event(action="send", item=item)
+
+    text = format_event(event, UTC, snapshot(json_incident(impact="critical")))
+
+    assert "🔴" in text
+    assert "[New incident]" in text
+    assert "Impact: <b>critical</b>" in text
+    assert "&lt;looking&gt;" in text
+    assert "https://stspg.io/abc" in text
+
+
+def test_format_resolved_is_green_even_if_json_lags():
+    item = rss_item(
+        pub_date="Wed, 03 Jun 2026 08:00:00 +0000",
+        status="Resolved",
+        body="This incident has been resolved.",
+    )
+    event = Event(action="send_resolved", item=item, message_id=42)
+
+    text = format_event(event, UTC, snapshot(json_incident(status="monitoring", impact="major")))
+
+    assert "✅" in text
+    assert "[Incident resolved]" in text
+    assert "Status: <b>Resolved</b>" in text
+    assert "This incident has been resolved." in text
+
+
+def test_format_overall_lists_active_json_incidents_for_test_command():
+    snap = snapshot(json_incident(status="investigating", impact="major"))
+
+    text = format_overall(snap, UTC)
+
+    assert "Partial System Outage" in text
+    assert "Elevated API error rates" in text
+
+
+# --- Poller send/edit behavior ----------------------------------------------
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str]] = []
+        self.edited: list[tuple[int, int, str]] = []
+
+    async def send_message(self, chat_id: int, text: str):
+        self.sent.append((chat_id, text))
+        return SimpleNamespace(message_id=100 + len(self.sent))
+
+    async def edit_message_text(self, text: str, *, chat_id: int, message_id: int):
+        self.edited.append((chat_id, message_id, text))
+        return True
+
+
+class FakeClient:
+    def __init__(self, items: list[RssItem], snap: StatusSnapshot) -> None:
+        self.items = items
+        self.snap = snap
+        self.fetch_count = 0
+
+    async def fetch_rss(self) -> list[RssItem]:
+        return self.items
+
+    async def fetch(self) -> StatusSnapshot:
+        self.fetch_count += 1
+        return self.snap
+
+
+@pytest.mark.asyncio
+async def test_poller_edits_non_resolved_update(monkeypatch):
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42
+    updated = rss_item(
+        pub_date="Wed, 03 Jun 2026 07:28:39 +0000",
+        status="Monitoring",
+        body="A fix has been implemented.",
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr("app.poller.save_state", lambda state: saved.append(copy.deepcopy(state)))
+
+    bot = FakeBot()
+    new_state = await poll_once(
+        bot,
+        FakeClient([updated], snapshot(json_incident(status="monitoring", impact="minor"))),
+        SimpleNamespace(chat_id=1, timezone=UTC),
+        state,
+    )
+
+    assert bot.sent == []
+    assert len(bot.edited) == 1
+    assert bot.edited[0][1] == 42
+    assert "Incident update" in bot.edited[0][2]
+    assert new_state["rss_items"][updated.guid]["message_id"] == 42
+    assert saved
+
+
+@pytest.mark.asyncio
+async def test_poller_sends_resolved_as_new_message(monkeypatch):
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42
+    resolved = rss_item(
+        pub_date="Wed, 03 Jun 2026 08:00:00 +0000",
+        status="Resolved",
+        body="This incident has been resolved.",
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr("app.poller.save_state", lambda state: saved.append(copy.deepcopy(state)))
+
+    bot = FakeBot()
+    new_state = await poll_once(
+        bot,
+        FakeClient([resolved], snapshot(json_incident(status="resolved", impact="minor"))),
+        SimpleNamespace(chat_id=1, timezone=UTC),
+        state,
+    )
+
+    assert bot.edited == []
+    assert len(bot.sent) == 1
+    assert "✅" in bot.sent[0][1]
+    assert "Incident resolved" in bot.sent[0][1]
+    assert new_state["rss_items"][resolved.guid]["resolved_message_id"] == 101
+    assert saved
+
+
+@pytest.mark.asyncio
+async def test_poller_ignores_json_component_changes_without_rss_event(monkeypatch):
+    item = rss_item()
+    state = seed_state(item)
+    state["rss_items"][item.guid]["message_id"] = 42
+    saved: list[dict] = []
+    monkeypatch.setattr("app.poller.save_state", lambda state: saved.append(copy.deepcopy(state)))
+    client = FakeClient(
+        [item],
+        snapshot(
+            json_incident(),
+            components=[{"id": "comp_api", "name": "API", "status": "major_outage"}],
+        ),
+    )
+
+    bot = FakeBot()
+    await poll_once(bot, client, SimpleNamespace(chat_id=1, timezone=UTC), state)
+
+    assert bot.sent == []
+    assert bot.edited == []
+    assert client.fetch_count == 0
+    assert saved == []

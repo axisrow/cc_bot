@@ -1,90 +1,59 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with this repository.
 
 ## What this is
 
-Telegram-бот на **aiogram 3.x**, который опрашивает публичный JSON API Atlassian Statuspage
-(`status.claude.com/api/v2`) и шлёт в чат уведомления о новых инцидентах, плановых работах и
-сменах статусов компонентов. HTML страницы не парсится — только JSON-эндпоинты.
+Telegram-бот на **aiogram 3.x** для `status.claude.com`. Источник уведомлений — RSS history feed
+`https://status.claude.com/history.rss`. JSON API Statuspage (`/api/v2/...`) нельзя убирать: он
+используется для enrichment уведомлений (impact/status/иконка/shortlink) и для команды `/test`.
 
 ## Commands
 
 ```bash
-# Окружение
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # впишите BOT_TOKEN (обязательно), при желании CHAT_ID
+cp .env.example .env            # впишите BOT_TOKEN, при желании CHAT_ID
 
-# Запуск
 python main.py
-
-# Тесты (офлайн, без Telegram и сети)
 pytest -v
-pytest tests/test_differ.py::test_new_incident_emits_event   # один тест
+pytest tests/test_differ.py::test_poller_edits_non_resolved_update
 
-# Docker (compose не используется)
 docker build -t cc-status-bot .
 docker run -d --restart unless-stopped --env-file .env -v "$(pwd)/data:/app/data" \
   --name cc_status_bot cc-status-bot
 ```
 
 Нет линтера/форматтера в конфиге — стиль поддерживается вручную (`from __future__ import annotations`,
-типизация, докстринги на русском).
+типизация, короткие русские докстринги/комментарии там, где они реально помогают).
 
 ## Architecture
 
-`main.py` поднимает **два конкурентных asyncio-цикла** на одной общей `aiohttp.ClientSession`:
-1. `dp.start_polling` — long-polling Telegram для команд (`app/handlers.py`).
-2. `run_poller` — фоновая задача, опрашивающая статус-страницу (`app/poller.py`).
+`main.py` поднимает два concurrent asyncio-потока на общей `aiohttp.ClientSession`:
+1. `dp.start_polling` — Telegram-команды (`/start`, `/test`) из `app/handlers.py`.
+2. `run_poller` — фоновый RSS poller из `app/poller.py`.
 
-`config` и `status_client` прокидываются в хендлеры как контекстные kwargs через `start_polling`.
+Основной конвейер уведомлений:
 
-### Конвейер опроса (ядро)
+`StatusClient.fetch_rss()` → `diff()` → `StatusClient.fetch()` для JSON enrichment → `format_event()` → `send_message`/`edit_message_text` → `save_state()`.
 
-`StatusClient.fetch()` → `diff()` → `format_event()` → `bot.send_message()` → `save_state()`.
+- **`status_client.py`** — парсит RSS (`RssItem`) и умеет тянуть JSON snapshot для enrichment и `/test`.
+- **`differ.py`** — чистая RSS-логика без сети и Telegram. Возвращает действия `send`, `edit`, `send_resolved`.
+- **`formatter.py`** — текст берёт из RSS, impact/status/icon/shortlink берёт из JSON incident по id из RSS URL.
+- **`poller.py`** — non-resolved RSS updates редактируют сохранённый `message_id`; `Resolved` всегда шлёт новое зелёное сообщение.
+- **`state.py`** — атомарно хранит `data/state.json`.
 
-- **`status_client.py`** — тянет три эндпоинта параллельно (`asyncio.gather`): `summary.json`
-  (компоненты + общий индикатор), `incidents.json`, `scheduled-maintenances.json`. Инциденты и
-  работы берутся из выделенных эндпоинтов (не из summary), чтобы видеть `resolved`/`completed`.
-  Возвращает `StatusSnapshot`. База API захардкожена в константе `API_BASE`.
-- **`differ.py`** — **чистая логика без сети и Telegram** (поэтому покрыта офлайн-тестами).
-  Сравнивает `StatusSnapshot` с сохранённым состоянием и возвращает `(events, new_state)`.
-- **`formatter.py`** — превращает `Event`/`StatusSnapshot` в HTML-сообщения (эмодзи по
-  impact/статусу, экранирование, конвертация времени в `DISPLAY_TIMEZONE`).
-- **`state.py`** — атомарная запись состояния (`tempfile` → `os.replace`) в `data/state.json`
-  (путь захардкожен в константе `STATE_FILE`).
+## State invariants
 
-### Как детектируется изменение (важно)
+Текущий контракт state: `rss_initialized: true` и `rss_items[guid]` с `pub_date`,
+`message_id`, `resolved_message_id`. Старые ключи `incidents`, `maintenances`, `components`
+могут оставаться в файле как legacy, но не должны создавать Telegram-события.
 
-Состояние — это «что уже отправили»: для инцидентов/работ хранится **id последнего обновления**
-(`incident_updates[0].id`, API отдаёт новейшее первым), для компонентов — строка статуса.
-`diff()` шлёт событие, если объект новый (`id` не в state) или у него изменился id обновления /
-статус.
-
-**Анти-спам при первом запуске:** если в состоянии нет ключа `initialized`, `diff()` молча
-засевает текущие id/статусы и НЕ генерирует события — иначе бот спамил бы всей историей. Это
-ключевая инвариант: при изменении логики диффа не сломайте «тихий» первый запуск.
-
-Компоненты-группы (`group: true`) пропускаются — следим только за листовыми сервисами.
-
-### Команды /start и /test
-
-`app/handlers.py`: **`/start`** — приветствие с описанием бота; **`/test`** — бот отвечает текущим
-статусом (`format_overall`) тому, кто её прислал (ручная проверка работоспособности). В остальном бот
-автономен и на произвольные сообщения НЕ реагирует (никакого catch-all). Polling Telegram оставлен
-ради приёма этих команд.
-
-### Конфигурация
-
-`app/config.py` → `Config` (frozen dataclass) из 4 env-переменных: `BOT_TOKEN` (обязателен),
-`CHAT_ID` (без него уведомления не шлются — работают только команды), `POLL_INTERVAL`,
-`DISPLAY_TIMEZONE`. Прочие параметры (база API, путь состояния) захардкожены константами в
-соответствующих модулях.
+Первый RSS-запуск засевает ленту молча. Это важно при миграции со старого JSON-state: наличие
+`initialized: true` без `rss_initialized` не должно разослать всю RSS-историю.
 
 ## Testing notes
 
-Тесты в `tests/test_differ.py` работают против фикстуры `tests/fixtures/sample.json` —
-конструируют `StatusSnapshot` напрямую и проверяют, что одно изменение даёт ровно одно событие,
-повторный опрос — ноль, а форматтер экранирует HTML. Сеть и Telegram не задействованы. При
-изменении формы `StatusSnapshot`/`Event` синхронизируйте фикстуру и тесты.
+Тесты в `tests/test_differ.py` офлайн проверяют RSS parsing, first-run seed, send/edit/resolved
+actions, JSON enrichment и poller calls. При изменении RSS state shape или Telegram behavior
+обновляйте эти тесты в первую очередь.
