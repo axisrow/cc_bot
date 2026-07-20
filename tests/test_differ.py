@@ -391,8 +391,12 @@ async def test_poller_critical_sends_each_update_separately(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_poller_unknown_impact_behaves_like_major(monkeypatch):
-    """snapshot is None (сбой enrichment) → unknown → ведём себя как major: edit если есть message_id."""
+@pytest.mark.parametrize(
+    "scenario",
+    ["snapshot_unavailable", "incident_not_in_snapshot"],
+)
+async def test_poller_unknown_impact_behaves_like_major(monkeypatch, scenario):
+    """unknown (сбой enrichment ИЛИ инцидент не найден в snapshot) → ведём себя как major: edit если есть message_id."""
     old_item = rss_item()
     state = seed_state(old_item)
     state["rss_items"][old_item.guid]["message_id"] = 42
@@ -403,15 +407,26 @@ async def test_poller_unknown_impact_behaves_like_major(monkeypatch):
     )
     monkeypatch.setattr("app.poller.save_state", lambda state: None)
 
-    class NoSnapshotClient(FakeClient):
-        async def fetch(self):
-            self.fetch_count += 1
-            raise RuntimeError("enrichment unavailable")
-
     bot = FakeBot()
+
+    if scenario == "snapshot_unavailable":
+        # (a) полный сбой fetch → snapshot is None.
+
+        class NoSnapshotClient(FakeClient):
+            async def fetch(self):
+                self.fetch_count += 1
+                raise RuntimeError("enrichment unavailable")
+
+        client = NoSnapshotClient([updated], snapshot(json_incident()))
+    else:
+        # (b) snapshot валиден, но этого incident_id в нём нет (другой id).
+        miss = json_incident()
+        miss["id"] = "inc_other"
+        client = FakeClient([updated], snapshot(miss))
+
     await poll_once(
         bot,
-        NoSnapshotClient([updated], snapshot(json_incident())),
+        client,
         SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
         state,
     )
