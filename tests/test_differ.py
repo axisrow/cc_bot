@@ -276,7 +276,7 @@ async def test_poller_edits_non_resolved_update(monkeypatch):
     bot = FakeBot()
     new_state = await poll_once(
         bot,
-        FakeClient([updated], snapshot(json_incident(status="monitoring", impact="minor"))),
+        FakeClient([updated], snapshot(json_incident(status="monitoring", impact="major"))),
         SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
         state,
     )
@@ -305,7 +305,7 @@ async def test_poller_sends_resolved_as_new_message(monkeypatch):
     bot = FakeBot()
     new_state = await poll_once(
         bot,
-        FakeClient([resolved], snapshot(json_incident(status="resolved", impact="minor"))),
+        FakeClient([resolved], snapshot(json_incident(status="resolved", impact="major"))),
         SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
         state,
     )
@@ -316,6 +316,110 @@ async def test_poller_sends_resolved_as_new_message(monkeypatch):
     assert "Incident resolved" in bot.sent[0][1]
     assert new_state["rss_items"][resolved.guid]["resolved_message_id"] == 101
     assert saved
+
+
+@pytest.mark.asyncio
+async def test_poller_skips_minor_incident(monkeypatch):
+    """minor-инцидент не отправляется ни send, ни edit — фильтр шума."""
+    new_item = rss_item()
+    state = empty_state()
+    state["rss_initialized"] = True
+    saved: list[dict] = []
+    monkeypatch.setattr("app.poller.save_state", lambda state: saved.append(copy.deepcopy(state)))
+
+    bot = FakeBot()
+    new_state = await poll_once(
+        bot,
+        FakeClient([new_item], snapshot(json_incident(status="investigating", impact="minor"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    assert bot.sent == []
+    assert bot.edited == []
+    # state всё равно сохраняется (инцидент засчитан в rss_items, просто без message_id).
+    assert saved
+    assert new_state["rss_items"][new_item.guid].get("message_id") is None
+
+
+@pytest.mark.asyncio
+async def test_poller_skips_none_impact(monkeypatch):
+    """impact=none тоже скипается (как и minor)."""
+    new_item = rss_item()
+    state = empty_state()
+    state["rss_initialized"] = True
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    bot = FakeBot()
+    await poll_once(
+        bot,
+        FakeClient([new_item], snapshot(json_incident(status="investigating", impact="none"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    assert bot.sent == []
+    assert bot.edited == []
+
+
+@pytest.mark.asyncio
+async def test_poller_critical_sends_each_update_separately(monkeypatch):
+    """critical: даже при наличии message_id каждый апдейт уходит новым сообщением, без edit."""
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42
+    updated = rss_item(
+        pub_date="Wed, 03 Jun 2026 07:28:39 +0000",
+        status="Identified",
+        body="The issue has been identified.",
+    )
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    bot = FakeBot()
+    new_state = await poll_once(
+        bot,
+        FakeClient([updated], snapshot(json_incident(status="identified", impact="critical"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    # Не edit, а новый send — для critical ведём живую ленту апдейтов.
+    assert bot.edited == []
+    assert len(bot.sent) == 1
+    # message_id в state перезаписан на id нового сообщения.
+    assert new_state["rss_items"][updated.guid]["message_id"] == 101
+
+
+@pytest.mark.asyncio
+async def test_poller_unknown_impact_behaves_like_major(monkeypatch):
+    """snapshot is None (сбой enrichment) → unknown → ведём себя как major: edit если есть message_id."""
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42
+    updated = rss_item(
+        pub_date="Wed, 03 Jun 2026 07:28:39 +0000",
+        status="Monitoring",
+        body="A fix has been implemented.",
+    )
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    class NoSnapshotClient(FakeClient):
+        async def fetch(self):
+            self.fetch_count += 1
+            raise RuntimeError("enrichment unavailable")
+
+    bot = FakeBot()
+    await poll_once(
+        bot,
+        NoSnapshotClient([updated], snapshot(json_incident())),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    # unknown деградирует до major: есть message_id → редактируем, а не шлём новое.
+    assert bot.sent == []
+    assert len(bot.edited) == 1
+    assert bot.edited[0][1] == 42
 
 
 @pytest.mark.asyncio

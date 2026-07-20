@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from app.config import Config
 from app.differ import Event, diff
-from app.formatter import format_event
+from app.formatter import find_json_incident, format_event
 from app.state import load_state, save_state
 from app.status_client import StatusClient, StatusSnapshot
 
@@ -71,6 +71,12 @@ def _record_message_id(state: dict, event: Event, message_id: int) -> None:
         entry["message_id"] = message_id
 
 
+def _event_impact(event: Event, snapshot: StatusSnapshot | None) -> str:
+    """impact инцидента из JSON snapshot; 'unknown' если snapshot/инцидент недоступен."""
+    json_item = find_json_incident(event.item, snapshot)
+    return (json_item or {}).get("impact") or "unknown"
+
+
 async def poll_once(
     bot: Bot,
     client: StatusClient,
@@ -95,15 +101,25 @@ async def poll_once(
         snapshot = await _fetch_enrichment(client)
         logger.info("Обрабатываю %d RSS-событий", len(events))
         for event in events:
+            impact = _event_impact(event, snapshot)
+            if impact in ("none", "minor"):
+                # Минорные инциденты и none — шум, пропускаем молча.
+                logger.info("Скип %s-инцидента %s", impact, event.item.guid)
+                continue
             text = format_event(event, config.timezone, snapshot)
-            is_edit = event.action == "edit" and event.message_id is not None
-            # edit с известным message_id редактирует исходное сообщение; если он
-            # не удался (или это send/send_resolved) — шлём новое и запоминаем id.
-            if not (is_edit and await _edit(bot, config.chat_id, event.message_id, text)):
-                message_id = await _send(
+            message_id = event.message_id
+            # edit с известным message_id правит исходник; иначе (send/send_resolved/critical
+            # или провал edit) шлём новое и запоминаем id. critical всегда идёт новым сообщением.
+            can_edit = impact != "critical" and event.action == "edit"
+            if not (
+                can_edit
+                and message_id is not None
+                and await _edit(bot, config.chat_id, message_id, text)
+            ):
+                new_message_id = await _send(
                     bot, config.chat_id, text, config.message_thread_id
                 )
-                _record_message_id(new_state, event, message_id)
+                _record_message_id(new_state, event, new_message_id)
             await asyncio.sleep(_SEND_DELAY)
     elif events:
         logger.warning("Есть %d событий, но CHAT_ID не задан — не отправляю", len(events))
