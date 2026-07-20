@@ -102,8 +102,13 @@ async def poll_once(
         logger.info("Обрабатываю %d RSS-событий", len(events))
         for event in events:
             impact = _event_impact(event, snapshot)
-            if impact in ("none", "minor"):
-                # Минорные инциденты и none — шум, пропускаем молча.
+            # Минорные инциденты и none — шум, пропускаем. Но резолв ранее отправленного
+            # инцидента (send_resolved с известным message_id) шлём всегда: иначе чат
+            # зависнет со стэйл активным сообщением, если Statuspage пересчитал impact вниз.
+            previously_alerted = (
+                event.action == "send_resolved" and event.message_id is not None
+            )
+            if impact in ("none", "minor") and not previously_alerted:
                 logger.info("Скип %s-инцидента %s", impact, event.item.guid)
                 continue
             text = format_event(event, config.timezone, snapshot)

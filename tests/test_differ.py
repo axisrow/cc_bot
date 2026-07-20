@@ -438,6 +438,33 @@ async def test_poller_unknown_impact_behaves_like_major(monkeypatch, scenario):
 
 
 @pytest.mark.asyncio
+async def test_poller_resolves_previously_alerted_incident_even_if_impact_dropped(monkeypatch):
+    """Резолв ранее отправленного инцидента шлётся всегда, даже если Statuspage
+    пересчитал JSON impact вниз до minor. Иначе чат зависнет со стэйл активным сообщением."""
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42  # инцидент уже был отправлен
+    resolved = rss_item(
+        pub_date="Wed, 03 Jun 2026 09:00:00 +0000",
+        status="Resolved",
+        body="This incident has been resolved.",
+    )
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    bot = FakeBot()
+    await poll_once(
+        bot,
+        FakeClient([resolved], snapshot(json_incident(status="resolved", impact="minor"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    # Ранее отправленный инцидент обязан получить зелёное resolved.
+    assert len(bot.sent) == 1
+    assert "✅" in bot.sent[0][1]
+
+
+@pytest.mark.asyncio
 async def test_poller_sends_to_configured_topic(monkeypatch):
     """Новое уведомление уходит в топик из MESSAGE_THREAD_ID, а не в General."""
     old_item = rss_item()
