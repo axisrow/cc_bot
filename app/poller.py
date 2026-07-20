@@ -102,13 +102,12 @@ async def poll_once(
         logger.info("Обрабатываю %d RSS-событий", len(events))
         for event in events:
             impact = _event_impact(event, snapshot)
-            # Минорные инциденты и none — шум, пропускаем. Но резолв ранее отправленного
-            # инцидента (send_resolved с известным message_id) шлём всегда: иначе чат
-            # зависнет со стэйл активным сообщением, если Statuspage пересчитал impact вниз.
-            previously_alerted = (
-                event.action == "send_resolved" and event.message_id is not None
-            )
-            if impact in ("none", "minor") and not previously_alerted:
+            # Минорные инциденты и none — шум, пропускаем. Но событие для инцидента, уже
+            # отправленного в чат (есть message_id), шлём всегда — даже если Statuspage
+            # пересчитал JSON impact вниз. Иначе edit/resolved потеряется, pub_date в state
+            # сдвинется, и Telegram зависнет на устаревшем статусе.
+            already_in_chat = event.message_id is not None
+            if impact in ("none", "minor") and not already_in_chat:
                 logger.info("Скип %s-инцидента %s", impact, event.item.guid)
                 continue
             text = format_event(event, config.timezone, snapshot)

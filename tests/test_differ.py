@@ -465,6 +465,35 @@ async def test_poller_resolves_previously_alerted_incident_even_if_impact_droppe
 
 
 @pytest.mark.asyncio
+async def test_poller_edits_previously_alerted_incident_even_if_impact_dropped(monkeypatch):
+    """Active-update (edit) ранее отправленного инцидента шлётся всегда, даже если
+    Statuspage пересчитал JSON impact вниз до minor. Иначе Telegram зависнет на
+    устаревшем major/critical статусе до следующего непросроченного события."""
+    old_item = rss_item()
+    state = seed_state(old_item)
+    state["rss_items"][old_item.guid]["message_id"] = 42  # инцидент уже был отправлен
+    updated = rss_item(
+        pub_date="Wed, 03 Jun 2026 08:00:00 +0000",
+        status="Identified",
+        body="The issue has been identified.",
+    )
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    bot = FakeBot()
+    await poll_once(
+        bot,
+        FakeClient([updated], snapshot(json_incident(status="identified", impact="minor"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    # Ранее отправленный активный инцидент обязан получить edit исходного сообщения.
+    assert bot.sent == []
+    assert len(bot.edited) == 1
+    assert bot.edited[0][1] == 42
+
+
+@pytest.mark.asyncio
 async def test_poller_sends_to_configured_topic(monkeypatch):
     """Новое уведомление уходит в топик из MESSAGE_THREAD_ID, а не в General."""
     old_item = rss_item()
