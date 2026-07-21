@@ -8,10 +8,11 @@ import logging
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
+from app.changelog_client import ChangelogClient
 from app.config import Config
 from app.differ import Event, diff
-from app.formatter import find_json_incident, format_event
-from app.state import load_state, save_state
+from app.formatter import find_json_incident, format_event, format_release
+from app.state import load_state, read_cc_version, save_state, write_cc_version
 from app.status_client import StatusClient, StatusSnapshot
 
 logger = logging.getLogger(__name__)
@@ -183,3 +184,54 @@ async def run_poller(bot: Bot, config: Config, client: StatusClient) -> None:
         except Exception:
             logger.exception("Ошибка во время опроса")
         await asyncio.sleep(config.poll_interval)
+
+
+async def poll_changelog_once(
+    bot: Bot, client: ChangelogClient, config: Config
+) -> None:
+    """Один цикл опроса CHANGELOG: шлёт уведомление только при новой версии.
+
+    First-run seed молча: сохранённой версии нет → записываем текущую, не шлём.
+    Версия живёт в отдельном data/cc_version.txt — единственный writer, поэтому
+    гонки со status-poller'ом (владельцем data/state.json) нет.
+    """
+    release = await client.fetch_top_release()
+    if release is None:
+        logger.warning("CHANGELOG не распарсен — пропускаю")
+        return
+
+    known = read_cc_version()
+    if known == release.version:
+        return
+
+    # Сохраняем ДО отправки: краш во время _send не приведёт к повторному алерту.
+    write_cc_version(release.version)
+
+    if not known:
+        logger.info("Первый опрос CHANGELOG: засеяно %s", release.version)
+        return
+
+    if config.chat_id is None:
+        logger.warning("Новый релиз %s, но CHAT_ID не задан", release.version)
+        return
+
+    text = format_release(release)
+    await _send(bot, config.chat_id, text, config.message_thread_id)
+
+
+async def run_changelog_poller(
+    bot: Bot, config: Config, client: ChangelogClient
+) -> None:
+    """Бесконечный цикл опроса CHANGELOG с интервалом config.changelog_interval."""
+    logger.info(
+        "CHANGELOG poller запущен: интервал %d c", config.changelog_interval
+    )
+    while True:
+        try:
+            await poll_changelog_once(bot, client, config)
+        except asyncio.CancelledError:
+            logger.info("CHANGELOG поллер остановлен")
+            raise
+        except Exception:
+            logger.exception("Ошибка во время опроса CHANGELOG")
+        await asyncio.sleep(config.changelog_interval)

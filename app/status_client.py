@@ -11,11 +11,12 @@ from xml.etree import ElementTree
 
 import aiohttp
 
+from app.http import _TIMEOUT, get_text
+
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://status.claude.com/api/v2"
 RSS_URL = "https://status.claude.com/history.rss"
-_TIMEOUT = aiohttp.ClientTimeout(total=30)
 _INCIDENT_ID_RE = re.compile(r"/incidents/([^/?#]+)")
 _RSS_UPDATE_RE = re.compile(
     r"<p>\s*<small>(?P<when>.*?)</small>\s*<br>\s*"
@@ -133,14 +134,9 @@ class StatusClient:
             resp.raise_for_status()
             return await resp.json()
 
-    async def _get_text_url(self, url: str) -> str:
-        async with self._session.get(url, timeout=_TIMEOUT) as resp:
-            resp.raise_for_status()
-            return await resp.text()
-
     async def fetch_rss(self) -> list[RssItem]:
         """Получить RSS history feed. RSS — единственный источник событий."""
-        return parse_rss_items(await self._get_text_url(RSS_URL))
+        return parse_rss_items(await get_text(self._session, RSS_URL))
 
     async def fetch_summary(self) -> dict:
         """Лёгкий запрос: summary.json для текущей сводки и JSON enrichment."""

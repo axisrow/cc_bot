@@ -7,6 +7,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
+from app.changelog_client import CHANGELOG_URL, Release
 from app.differ import Event
 from app.status_client import RssItem, StatusSnapshot
 
@@ -130,6 +131,20 @@ def format_event(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = N
     RSS создаёт событие, snapshot нужен только для JSON enrichment.
     """
     return _format_incident(event, tz, snapshot)
+
+
+def format_release(release: Release) -> str:
+    """HTML-сообщение о новом релизе Claude Code.
+
+    notes_md эскейпится: внутри markdown-инлайнов могут быть <, >, &.
+    """
+    lines = [f"🚀 <b>Claude Code {_esc(release.version)}</b>"]
+    if release.notes_md:
+        lines.append("")
+        lines.append(_esc(release.notes_md))
+    lines.append("")
+    lines.append(f"🔗 {_esc(CHANGELOG_URL)}")
+    return "\n".join(lines)
 
 
 def _overall_header(snapshot: StatusSnapshot) -> tuple[str, str]:

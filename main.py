@@ -11,8 +11,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from app import handlers
+from app.changelog_client import ChangelogClient
 from app.config import ConfigError, load_config
-from app.poller import run_poller
+from app.poller import run_changelog_poller, run_poller
 from app.status_client import StatusClient
 
 logging.basicConfig(
@@ -39,12 +40,23 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(handlers.router)
 
-    # Одна общая HTTP-сессия на поллер и команду /status (переиспользование соединений).
+    # Одна общая HTTP-сессия на поллеры и команду /status (переиспользование соединений).
     async with aiohttp.ClientSession() as session:
         client = StatusClient(session)
+        changelog_client = ChangelogClient(session)
 
-        # Фоновый опрос статус-страницы рядом с long-polling Telegram.
-        poller_task = asyncio.create_task(run_poller(bot, config, client))
+        async def run_pollers() -> None:
+            """Оркестратор двух фоновых циклов: статус-страница и релизы Claude Code.
+
+            Таски в gather изолированы — отказ одного не глушит другой.
+            """
+            await asyncio.gather(
+                run_poller(bot, config, client),
+                run_changelog_poller(bot, config, changelog_client),
+            )
+
+        # Фоновый опрос рядом с long-polling Telegram.
+        poller_task = asyncio.create_task(run_pollers())
 
         logger.info("Запускаю polling…")
         try:

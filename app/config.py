@@ -41,6 +41,7 @@ class Config:
     message_thread_id: int | None
     admin_id: int | None
     poll_interval: int
+    changelog_interval: int
     timezone: ZoneInfo
 
 
@@ -68,5 +69,6 @@ def load_config() -> Config:
         message_thread_id=message_thread_id,
         admin_id=admin_id,
         poll_interval=_get_int("POLL_INTERVAL", 120),
+        changelog_interval=_get_int("CHANGELOG_INTERVAL", 1800),
         timezone=timezone,
     )
