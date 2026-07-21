@@ -207,10 +207,10 @@ def test_format_release_is_compact_under_telegram_limit():
     """Регрессия oversized: сообщение о релизе не должно превышать лимит Telegram.
 
     Живой релиз Claude Code содержит десятки строк changelog'а (~5KB), что
-    превышает лимит sendMessage (4096) и приводит к rejection. Формат держит
-    только версию + ссылку, поэтому длина ограничена и не зависит от содержания.
+    превышает лимит sendMessage (4096) и приводит к rejection. Формат — только
+    заголовок с версией, без буллетов и без ссылки.
     """
     msg = format_release(Release("2.1.216"))
     assert len(msg) < 4096
     assert "2.1.216" in msg
-    assert "CHANGELOG.md" in msg or "raw.githubusercontent" in msg
+    assert "\n" not in msg  # однострочник, без ссылок и буллетов
