@@ -17,5 +17,5 @@ __pycache__/
 .DS_Store
 
 # Claude Code (локальные персональные настройки)
-.claude/settings.local.json
+.claude/
 AGENTS.md
