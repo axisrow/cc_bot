@@ -73,7 +73,8 @@ def _fmt_rss_time(value: str | None, tz: ZoneInfo) -> str:
         return value
 
 
-def _find_json_incident(item: RssItem, snapshot: StatusSnapshot | None) -> dict | None:
+def find_json_incident(item: RssItem, snapshot: StatusSnapshot | None) -> dict | None:
+    """Найти JSON-инцидент для RSS item по incident_id. Общий lookup для poller и formatter."""
     if snapshot is None or item.incident_id is None:
         return None
     for incident in snapshot.incidents:
@@ -92,7 +93,7 @@ def _json_or_rss_status(item: RssItem, json_item: dict | None) -> str:
 
 def _format_incident(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = None) -> str:
     item = event.item
-    json_item = _find_json_incident(item, snapshot)
+    json_item = find_json_incident(item, snapshot)
     impact = (json_item or {}).get("impact") or "unknown"
     status = _json_or_rss_status(item, json_item)
     resolved = status == "resolved"
