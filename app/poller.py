@@ -77,6 +77,20 @@ def _event_impact(event: Event, snapshot: StatusSnapshot | None) -> str:
     return (json_item or {}).get("impact") or "unknown"
 
 
+def _revert_pubdate(new_state: dict, state: dict, guid: str) -> None:
+    """Откатить pub_date скипнутого инцидента к previous значению.
+
+    Скип = мы ничего не сообщили пользователю, значит state не должен «запоминать»
+    свежий pub_date как обработанный. Иначе при росте JSON impact до major/critical
+    без нового RSS-pubDate diff() сочтёт инцидент уже виденным и не сгенерит событие.
+    """
+    entry = new_state.get("rss_items", {}).get(guid)
+    if entry is None:
+        return
+    previous = state.get("rss_items", {}).get(guid) or {}
+    entry["pub_date"] = previous.get("pub_date")
+
+
 async def poll_once(
     bot: Bot,
     client: StatusClient,
@@ -102,13 +116,18 @@ async def poll_once(
         logger.info("Обрабатываю %d RSS-событий", len(events))
         for event in events:
             impact = _event_impact(event, snapshot)
-            # Минорные инциденты и none — шум, пропускаем. Но событие для инцидента, уже
-            # отправленного в чат (есть message_id), шлём всегда — даже если Statuspage
-            # пересчитал JSON impact вниз. Иначе edit/resolved потеряется, pub_date в state
-            # сдвинется, и Telegram зависнет на устаревшем статусе.
+            # Минорные инциденты и none — шум, пропускаем. Но:
+            #  (1) событие для инцидента, уже отправленного в чат (есть message_id), шлём
+            #      всегда — иначе Telegram зависнет на устаревшем статусе, если Statuspage
+            #      пересчитал impact вниз уже после того, как мы послали major/critical;
+            #  (2) для нового скипнутого инцидента (нет message_id) НЕ фиксируем свежий
+            #      pub_date в state — оставляем previous, иначе при росте impact до
+            #      major/critical (без новой RSS-pubDate) событие не перегенерится и
+            #      critical-алерт потеряется навсегда.
             already_in_chat = event.message_id is not None
             if impact in ("none", "minor") and not already_in_chat:
                 logger.info("Скип %s-инцидента %s", impact, event.item.guid)
+                _revert_pubdate(new_state, state, event.item.guid)
                 continue
             text = format_event(event, config.timezone, snapshot)
             message_id = event.message_id

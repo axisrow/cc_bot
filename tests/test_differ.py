@@ -494,6 +494,38 @@ async def test_poller_edits_previously_alerted_incident_even_if_impact_dropped(m
 
 
 @pytest.mark.asyncio
+async def test_poller_skipped_new_incident_regenerates_when_impact_rises(monkeypatch):
+    """Скипнутый НОВЫЙ инцидент (нет message_id) не фиксирует pub_date в state — иначе при
+    росте JSON impact до major/critical без новой RSS-pubDate critical-алерт потеряется."""
+    monkeypatch.setattr("app.poller.save_state", lambda state: None)
+
+    # poll 1: новый инцидент, JSON impact=minor → скип
+    item = rss_item()
+    state = empty_state()
+    state["rss_initialized"] = True
+    bot = FakeBot()
+    state = await poll_once(
+        bot,
+        FakeClient([item], snapshot(json_incident(status="investigating", impact="minor"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+    assert bot.sent == []  # minor скипнут
+
+    # poll 2: тот же RSS-item (pub_date НЕ менялся), но JSON impact вырос до major
+    bot = FakeBot()
+    await poll_once(
+        bot,
+        FakeClient([item], snapshot(json_incident(status="investigating", impact="major"))),
+        SimpleNamespace(chat_id=1, message_thread_id=None, timezone=UTC),
+        state,
+    )
+
+    # major-алерт обязан сгенерироваться — инцидент не «запомнен» как виденный.
+    assert len(bot.sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_poller_sends_to_configured_topic(monkeypatch):
     """Новое уведомление уходит в топик из MESSAGE_THREAD_ID, а не в General."""
     old_item = rss_item()
