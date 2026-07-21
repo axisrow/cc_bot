@@ -7,6 +7,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
+from app.changelog_client import Release
 from app.differ import Event
 from app.status_client import RssItem, StatusSnapshot
 
@@ -130,6 +131,16 @@ def format_event(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = N
     RSS создаёт событие, snapshot нужен только для JSON enrichment.
     """
     return _format_incident(event, tz, snapshot)
+
+
+def format_release(release: Release) -> str:
+    """HTML-сообщение о новом релизе: только заголовок с версией.
+
+    Полные буллеты changelog'а не вставляем — релизы Claude Code содержат
+    десятки строк (живой 2.1.216 — ~5KB), что превышает лимит Telegram
+    sendMessage (4096) и приводит к rejection.
+    """
+    return f"🚀 <b>Claude Code {_esc(release.version)}</b>"
 
 
 def _overall_header(snapshot: StatusSnapshot) -> tuple[str, str]:

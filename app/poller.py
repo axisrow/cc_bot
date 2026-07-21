@@ -8,10 +8,11 @@ import logging
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
+from app.changelog_client import ChangelogClient
 from app.config import Config
 from app.differ import Event, diff
-from app.formatter import find_json_incident, format_event
-from app.state import load_state, save_state
+from app.formatter import find_json_incident, format_event, format_release
+from app.state import load_state, read_cc_version, save_state, write_cc_version
 from app.status_client import StatusClient, StatusSnapshot
 
 logger = logging.getLogger(__name__)
@@ -183,3 +184,65 @@ async def run_poller(bot: Bot, config: Config, client: StatusClient) -> None:
         except Exception:
             logger.exception("Ошибка во время опроса")
         await asyncio.sleep(config.poll_interval)
+
+
+async def poll_changelog_once(
+    bot: Bot, client: ChangelogClient, config: Config
+) -> None:
+    """Один цикл опроса CHANGELOG: шлёт уведомление только при новой версии.
+
+    First-run seed молча: сохранённой версии нет → записываем текущую, не шлём.
+    Версия живёт в отдельном data/cc_version.txt — единственный writer, поэтому
+    гонки со status-poller'ом (владельцем data/state.json) нет.
+
+    Инварианта доставки: checkpoint версии продвигается только когда уведомление
+    фактически доставлено (или когда доставки не требуется — first-run / no-CHAT_ID).
+    При сбое _send (сеть, TelegramBadRequest) версия НЕ записывается → следующий
+    цикл повторит отправку, а не потеряет релиз навсегда.
+    """
+    release = await client.fetch_top_release()
+    if release is None:
+        logger.warning("CHANGELOG не распарсен — пропускаю")
+        return
+
+    known = read_cc_version()
+    if known == release.version:
+        return
+
+    # Доставки не требуется — checkpoint нужен, чтобы не зависнуть на одном цикле.
+    if not known:
+        write_cc_version(release.version)
+        logger.info("Первый опрос CHANGELOG: засеяно %s", release.version)
+        return
+
+    if config.chat_id is None:
+        # Нет куда слать, но версию фиксируем: иначе при включении CHAT_ID бот
+        # выплюнет все пропущенные релизы скопом. Считаем «замеченным».
+        write_cc_version(release.version)
+        logger.warning("Новый релиз %s, но CHAT_ID не задан", release.version)
+        return
+
+    # Сначала доставка, потом checkpoint. Провал _send пробрасывается наверх
+    # (run_changelog_poller логирует и ждёт до следующего цикла) — версия
+    # останется прежней, и отправка повторится.
+    text = format_release(release)
+    await _send(bot, config.chat_id, text, config.message_thread_id)
+    write_cc_version(release.version)
+
+
+async def run_changelog_poller(
+    bot: Bot, config: Config, client: ChangelogClient
+) -> None:
+    """Бесконечный цикл опроса CHANGELOG с интервалом config.changelog_interval."""
+    logger.info(
+        "CHANGELOG poller запущен: интервал %d c", config.changelog_interval
+    )
+    while True:
+        try:
+            await poll_changelog_once(bot, client, config)
+        except asyncio.CancelledError:
+            logger.info("CHANGELOG поллер остановлен")
+            raise
+        except Exception:
+            logger.exception("Ошибка во время опроса CHANGELOG")
+        await asyncio.sleep(config.changelog_interval)
