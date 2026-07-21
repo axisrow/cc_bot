@@ -134,17 +134,16 @@ def format_event(event: Event, tz: ZoneInfo, snapshot: StatusSnapshot | None = N
 
 
 def format_release(release: Release) -> str:
-    """HTML-сообщение о новом релизе Claude Code.
+    """HTML-сообщение о новом релизе: только версия + ссылка на CHANGELOG.
 
-    notes_md эскейпится: внутри markdown-инлайнов могут быть <, >, &.
+    Полные буллеты changelog'а не вставляем — релизы Claude Code содержат
+    десятки строк (живой 2.1.216 — ~5KB), что превышает лимит Telegram
+    sendMessage (4096) и приводит к rejection. Ссылка даёт детали.
     """
-    lines = [f"🚀 <b>Claude Code {_esc(release.version)}</b>"]
-    if release.notes_md:
-        lines.append("")
-        lines.append(_esc(release.notes_md))
-    lines.append("")
-    lines.append(f"🔗 {_esc(CHANGELOG_URL)}")
-    return "\n".join(lines)
+    return (
+        f"🚀 <b>New Claude Code release: {_esc(release.version)}</b>\n"
+        f"🔗 {_esc(CHANGELOG_URL)}"
+    )
 
 
 def _overall_header(snapshot: StatusSnapshot) -> tuple[str, str]:

@@ -16,29 +16,26 @@ CHANGELOG_URL = "https://raw.githubusercontent.com/anthropics/claude-code/main/C
 
 @dataclass(frozen=True)
 class Release:
-    """Один релиз из верхнего блока CHANGELOG."""
+    """Верхний релиз из CHANGELOG (только версия — этого хватает для уведомления)."""
 
     version: str  # "2.1.216"
-    notes_md: str  # буллеты верхнего блока до следующего "## "
 
 
 def parse_top_release(text: str) -> Release | None:
     """Вернуть верхний релиз из CHANGELOG. Чистая, без сети.
 
-    Первый заголовок вида '## <version>' задаёт версию; notes — строки от него
-    до следующего '## '. Если заголовка нет или он пустой — None.
+    Первый заголовок вида '## <version>' задаёт версию. Если заголовка нет или
+    он пустой — None. Буллеты changelog'а не собираем: уведомление содержит
+    только версию + ссылку (полные notes превышают лимит Telegram sendMessage).
     """
     lines = text.splitlines()
-    headers = [i for i, line in enumerate(lines) if line.startswith("## ")]
-    if not headers:
-        return None
-    start = headers[0]
-    end = headers[1] if len(headers) > 1 else len(lines)
-    version = lines[start][len("## "):].strip()
-    if not version:
-        return None
-    notes_md = "\n".join(lines[start + 1:end]).strip()
-    return Release(version=version, notes_md=notes_md)
+    for line in lines:
+        if line.startswith("## "):
+            version = line[len("## "):].strip()
+            if version:
+                return Release(version=version)
+            break
+    return None
 
 
 class ChangelogClient:

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.changelog_client import Release, parse_top_release
+from app.formatter import format_release
 from app.poller import poll_changelog_once
 
 UTC = ZoneInfo("UTC")
@@ -26,11 +27,18 @@ _CHANGELOG_SAMPLE = """\
 """
 
 
+class FailingSend(Exception):
+    """Эмуляция провала Telegram-отправки (например, TelegramBadRequest)."""
+
+
 class FakeBot:
-    def __init__(self) -> None:
+    def __init__(self, fail_send: bool = False) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.fail_send = fail_send
 
     async def send_message(self, chat_id: int, text: str, message_thread_id=None):
+        if self.fail_send:
+            raise FailingSend("message is too long")
         self.sent.append((chat_id, text))
         return SimpleNamespace(message_id=100 + len(self.sent))
 
@@ -52,25 +60,19 @@ def _config(chat_id: int | None = 1) -> SimpleNamespace:
 # --- Парсер (чистая функция) ---
 
 
-def test_parse_top_release_extracts_version_and_notes():
+def test_parse_top_release_extracts_top_version():
     release = parse_top_release(_CHANGELOG_SAMPLE)
     assert release is not None
     assert release.version == "2.1.216"
-    assert "sandbox.filesystem.disabled" in release.notes_md
-    assert "Fixed a slowdown" in release.notes_md
-    # notes верхнего блока, без следующего релиза
-    assert "auto mode" not in release.notes_md
 
 
 def test_parse_top_release_no_header_returns_none():
     assert parse_top_release("Обычный текст без заголовков.\nВторая строка.") is None
 
 
-def test_parse_top_release_empty_notes():
-    release = parse_top_release("# Changelog\n\n## 2.1.217\n\n## 2.1.216\n")
-    assert release is not None
-    assert release.version == "2.1.217"
-    assert release.notes_md == ""
+def test_parse_top_release_empty_header_returns_none():
+    # заголовок есть, но версия пустая → None
+    assert parse_top_release("# Changelog\n\n##  \n\n## 2.1.216\n") is None
 
 
 # --- poll_changelog_once ---
@@ -84,7 +86,7 @@ async def test_poll_changelog_first_run_seeds_silently(monkeypatch):
     monkeypatch.setattr("app.poller.write_cc_version", lambda v: written.append(v))
 
     bot = FakeBot()
-    client = FakeChangelogClient(Release("2.1.216", "- Fix"))
+    client = FakeChangelogClient(Release("2.1.216"))
     await poll_changelog_once(bot, client, _config())
 
     assert bot.sent == []
@@ -92,17 +94,48 @@ async def test_poll_changelog_first_run_seeds_silently(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_poll_changelog_new_version_sends_message(monkeypatch):
-    """Сохранена старая версия, CHANGELOG отдаёт новую → уходим сообщение."""
+async def test_poll_changelog_new_version_sends_and_checkpoints(monkeypatch):
+    """Новый релиз: сообщение уходит, checkpoint пишется ПОСЛЕ успешного send."""
     monkeypatch.setattr("app.poller.read_cc_version", lambda: "2.1.215")
-    monkeypatch.setattr("app.poller.write_cc_version", lambda v: None)
+    events: list[str] = []
+
+    def _write(v):
+        events.append(f"write:{v}")
+
+    async def _fake_send(bot_arg, chat_id, text, thread_id=None):
+        events.append(f"send:{chat_id}")
+        return 101
+
+    monkeypatch.setattr("app.poller.write_cc_version", _write)
+    monkeypatch.setattr("app.poller._send", _fake_send)
 
     bot = FakeBot()
-    client = FakeChangelogClient(Release("2.1.216", "- Fix"))
+    client = FakeChangelogClient(Release("2.1.216"))
     await poll_changelog_once(bot, client, _config())
 
-    assert len(bot.sent) == 1
-    assert "2.1.216" in bot.sent[0][1]
+    # Порядок критичен: send ДО write. Если write первым — провал отправки
+    # пометит релиз доставленным (регрессия Codex-фишинга).
+    assert events == ["send:1", "write:2.1.216"]
+
+
+@pytest.mark.asyncio
+async def test_poll_changelog_failed_send_leaves_version_uncheckpointed(monkeypatch):
+    """Регрессия: провал _send НЕ должен продвигать checkpoint версии.
+
+    Иначе отклонённый Telegram-релиз (oversized / bad-request) навсегда
+    теряется — версия записана как доставленная, но в чат не ушла.
+    """
+    monkeypatch.setattr("app.poller.read_cc_version", lambda: "2.1.215")
+    written: list[str] = []
+    monkeypatch.setattr("app.poller.write_cc_version", lambda v: written.append(v))
+
+    bot = FakeBot(fail_send=True)
+    client = FakeChangelogClient(Release("2.1.216"))
+    with pytest.raises(FailingSend):
+        await poll_changelog_once(bot, client, _config())
+
+    assert bot.sent == []
+    assert written == []  # версия не записана → следующий цикл повторит
 
 
 @pytest.mark.asyncio
@@ -113,7 +146,7 @@ async def test_poll_changelog_same_version_noop(monkeypatch):
     monkeypatch.setattr("app.poller.write_cc_version", lambda v: written.append(v))
 
     bot = FakeBot()
-    client = FakeChangelogClient(Release("2.1.216", "- Fix"))
+    client = FakeChangelogClient(Release("2.1.216"))
     await poll_changelog_once(bot, client, _config())
 
     assert bot.sent == []
@@ -129,7 +162,7 @@ async def test_poll_changelog_does_not_touch_state_json(monkeypatch):
     monkeypatch.setattr("app.poller.write_cc_version", lambda v: None)
 
     bot = FakeBot()
-    client = FakeChangelogClient(Release("2.1.216", "- Fix"))
+    client = FakeChangelogClient(Release("2.1.216"))
     await poll_changelog_once(bot, client, _config())
 
     assert len(bot.sent) == 1
@@ -137,16 +170,22 @@ async def test_poll_changelog_does_not_touch_state_json(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_poll_changelog_no_chat_id_logs_only(monkeypatch):
-    """CHAT_ID не задан → новый релиз логируется, но не отправляется."""
+async def test_poll_changelog_no_chat_id_checkpoints_without_sending(monkeypatch):
+    """CHAT_ID не задан → новый релиз не отправляется, но версия фиксируется.
+
+    Иначе при позднем включении CHAT_ID бот выплюнет все пропущенные релизы
+    скопом. Считаем «замеченным», доставка не требуется.
+    """
     monkeypatch.setattr("app.poller.read_cc_version", lambda: "2.1.215")
-    monkeypatch.setattr("app.poller.write_cc_version", lambda v: None)
+    written: list[str] = []
+    monkeypatch.setattr("app.poller.write_cc_version", lambda v: written.append(v))
 
     bot = FakeBot()
-    client = FakeChangelogClient(Release("2.1.216", "- Fix"))
+    client = FakeChangelogClient(Release("2.1.216"))
     await poll_changelog_once(bot, client, _config(chat_id=None))
 
     assert bot.sent == []
+    assert written == ["2.1.216"]
 
 
 @pytest.mark.asyncio
@@ -162,3 +201,16 @@ async def test_poll_changelog_unparseable_skips(monkeypatch):
 
     assert bot.sent == []
     assert written == []
+
+
+def test_format_release_is_compact_under_telegram_limit():
+    """Регрессия oversized: сообщение о релизе не должно превышать лимит Telegram.
+
+    Живой релиз Claude Code содержит десятки строк changelog'а (~5KB), что
+    превышает лимит sendMessage (4096) и приводит к rejection. Формат держит
+    только версию + ссылку, поэтому длина ограничена и не зависит от содержания.
+    """
+    msg = format_release(Release("2.1.216"))
+    assert len(msg) < 4096
+    assert "2.1.216" in msg
+    assert "CHANGELOG.md" in msg or "raw.githubusercontent" in msg

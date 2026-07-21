@@ -194,6 +194,11 @@ async def poll_changelog_once(
     First-run seed молча: сохранённой версии нет → записываем текущую, не шлём.
     Версия живёт в отдельном data/cc_version.txt — единственный writer, поэтому
     гонки со status-poller'ом (владельцем data/state.json) нет.
+
+    Инварианта доставки: checkpoint версии продвигается только когда уведомление
+    фактически доставлено (или когда доставки не требуется — first-run / no-CHAT_ID).
+    При сбое _send (сеть, TelegramBadRequest) версия НЕ записывается → следующий
+    цикл повторит отправку, а не потеряет релиз навсегда.
     """
     release = await client.fetch_top_release()
     if release is None:
@@ -204,19 +209,25 @@ async def poll_changelog_once(
     if known == release.version:
         return
 
-    # Сохраняем ДО отправки: краш во время _send не приведёт к повторному алерту.
-    write_cc_version(release.version)
-
+    # Доставки не требуется — checkpoint нужен, чтобы не зависнуть на одном цикле.
     if not known:
+        write_cc_version(release.version)
         logger.info("Первый опрос CHANGELOG: засеяно %s", release.version)
         return
 
     if config.chat_id is None:
+        # Нет куда слать, но версию фиксируем: иначе при включении CHAT_ID бот
+        # выплюнет все пропущенные релизы скопом. Считаем «замеченным».
+        write_cc_version(release.version)
         logger.warning("Новый релиз %s, но CHAT_ID не задан", release.version)
         return
 
+    # Сначала доставка, потом checkpoint. Провал _send пробрасывается наверх
+    # (run_changelog_poller логирует и ждёт до следующего цикла) — версия
+    # останется прежней, и отправка повторится.
     text = format_release(release)
     await _send(bot, config.chat_id, text, config.message_thread_id)
+    write_cc_version(release.version)
 
 
 async def run_changelog_poller(
